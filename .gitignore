@@ -21,3 +21,10 @@ tmux.1.*
 cmd-parse.c
 fuzz/*-fuzzer
 .dirstamp
+
+# --- tmuxv ---
+# Compilation hors arbre : tout artefact vit dans build/
+/build/
+# Paquet Debian
+/packaging/build/
+/packaging/*.deb

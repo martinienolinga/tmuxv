@@ -244,6 +244,7 @@ struct window_copy_mode_data {
 	} cursordrag;
 
 	int		 modekeys;
+	int		 mousesel;	/* selection made by a mouse drag */
 	enum {
 		LINE_SEL_NONE,
 		LINE_SEL_LEFT_RIGHT,
@@ -695,6 +696,74 @@ window_copy_pagedown(struct window_mode_entry *wme, int half_page,
 	window_copy_update_selection(wme, 1, 0);
 	window_copy_redraw_screen(wme);
 	return (0);
+}
+
+/*
+ * SCROLLBAR (DESKTOP): read the pane's current scroll state. Returns 1 with
+ * *oy = lines scrolled back from the bottom (0 = live), *hsize = scrollback
+ * height, *sy = viewport height, when in copy mode; 0 otherwise.
+ */
+int
+window_copy_get_scroll(struct window_pane *wp, u_int *oy, u_int *hsize,
+    u_int *sy)
+{
+	struct window_mode_entry	*wme = TAILQ_FIRST(&wp->modes);
+	struct window_copy_mode_data	*data;
+
+	if (wme == NULL || wme->mode != &window_copy_mode)
+		return (0);
+	data = wme->data;
+	if (oy != NULL)
+		*oy = data->oy;
+	if (hsize != NULL)
+		*hsize = screen_hsize(data->backing);
+	if (sy != NULL)
+		*sy = screen_size_y(&data->screen);
+	return (1);
+}
+
+/*
+ * SCROLLBAR (DESKTOP): scroll to an absolute offset (0 = bottom/live, up to
+ * hsize = oldest), entering copy mode first if necessary.
+ */
+void
+window_copy_set_scroll(struct window_pane *wp, u_int target_oy)
+{
+	struct window_mode_entry	*wme;
+	struct window_copy_mode_data	*data;
+	u_int				 hsize;
+
+	wme = TAILQ_FIRST(&wp->modes);
+	if (wme == NULL || wme->mode != &window_copy_mode) {
+		struct args	*args = args_create();
+		int		 rc;
+
+		/* window_copy_init() reads args (args_has), so pass a real
+		 * empty args, never NULL. */
+		rc = window_pane_set_mode(wp, wp, &window_copy_mode, NULL, args);
+		args_free(args);
+		if (rc != 0)
+			return;
+		wme = TAILQ_FIRST(&wp->modes);
+		if (wme == NULL || wme->mode != &window_copy_mode)
+			return;
+	}
+	data = wme->data;
+	hsize = screen_hsize(data->backing);
+	if (target_oy > hsize)
+		target_oy = hsize;
+	if (target_oy == data->oy)
+		return;
+	/*
+	 * Set the offset and fully redraw every line. We deliberately do NOT
+	 * use window_copy_scroll_up/down here: their partial insertline/
+	 * deleteline only "nukes" the pushed position marker when ny == 1, so
+	 * a multi-line scrollbar step (ny > 1) leaves stale "[oy/total]"
+	 * markers stacked down the screen. A full redraw is clean and cheap.
+	 */
+	data->oy = target_oy;
+	window_copy_update_selection(wme, 0, 0);
+	window_copy_redraw_screen(wme);
 }
 
 static void
@@ -4458,6 +4527,7 @@ window_copy_start_selection(struct window_mode_entry *wme)
 	data->endsely = data->sely;
 
 	data->cursordrag = CURSORDRAG_ENDSEL;
+	data->mousesel = 0;
 
 	window_copy_set_selection(wme, 1, 0);
 }
@@ -4542,7 +4612,7 @@ window_copy_set_selection(struct window_mode_entry *wme, int may_redraw,
 	style_apply(&gc, oo, "mode-style", NULL);
 	gc.flags |= GRID_FLAG_NOPALETTE;
 	screen_set_selection(s, sx, sy, endsx, endsy, data->rectflag,
-	    data->modekeys, &gc);
+	    data->mousesel ? MODEKEY_VI : data->modekeys, &gc);
 
 	if (data->rectflag && may_redraw) {
 		/*
@@ -4631,6 +4701,8 @@ window_copy_get_selection(struct window_mode_entry *wme, size_t *len)
 	 * keep bottom-right-most character.
 	 */
 	keys = options_get_number(wp->window->options, "mode-keys");
+	if (data->mousesel)
+		keys = MODEKEY_VI;	/* inclusive, as it was shown */
 	if (data->rectflag) {
 		/*
 		 * Need to ignore the column with the cursor in it, which for
@@ -5600,6 +5672,12 @@ window_copy_start_drag(struct client *c, struct mouse_event *m)
 	case SEL_CHAR:
 		window_copy_update_cursor(wme, x, y);
 		window_copy_start_selection(wme);
+		/*
+		 * With the mouse, the cell under the pointer is part of the
+		 * selection (emacs keys otherwise leave it out, so releasing
+		 * on the last letter of a word lost that letter).
+		 */
+		data->mousesel = 1;
 		break;
 	}
 

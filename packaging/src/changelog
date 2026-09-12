@@ -1,0 +1,274 @@
+tmuxv (3.4+tmuxv16) unstable; urgency=high
+
+  * Gestionnaire Claude : les agents recevaient mal leur courrier.
+    - Les conversations cachees gardaient leur case de la mosaique : avec
+      trente conversations, 24x5. Claude Code n'y dessinait pas son invite,
+      tmuxv ne trouvait donc jamais l'agent "pret" et le courrier restait en
+      attente. Elles ont maintenant la taille de la conversation affichee
+      (elles ne sont pas dessinees, rien ne l'interdisait) ; les captures de
+      leur console sont completes du meme coup.
+    - Changer de conversation ne passe plus par un dezoom : aucune autre
+      session n'est redessinee a chaque clic.
+    - L'invite est cherchee du bas vers le haut sur tout l'ecran (une
+      conversation courte l'affiche en haut) ; un menu a choix (demande
+      d'autorisation, "❯ 1. Yes", confiance du dossier) n'est jamais repondu
+      a la place de l'utilisateur.
+    - Un agent inactif depuis plus d'une heure disparaissait de /agents : son
+      courrier n'etait plus compte, donc plus jamais releve. tmuxv lit
+      /agents?all=1, et reinscrit toutes les 10 minutes les agents qu'il
+      heberge, qui restent visibles des autres (list_agents).
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Sat, 12 Sep 2026 13:30:00 +0100
+
+tmuxv (3.4+tmuxv15) unstable; urgency=low
+
+  * La boite "A propos" affiche la vraie version de tmuxv (celle du paquet,
+    inscrite a la compilation) et la date de compilation : un serveur
+    remplace a chaud montre donc ce qu'il execute reellement. Nouveau
+    format #{tmuxv_version}. tmuxv -V ne change pas (tpm y lit 3.4).
+  * packaging/build.sh refuse un binaire qui ne porte pas la version du
+    paquet (version changee sans recompiler).
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Sat, 12 Sep 2026 10:00:00 +0100
+
+tmuxv (3.4+tmuxv14) unstable; urgency=medium
+
+  * Bus d'agents : pieces jointes. Les agents s'echangent des fichiers
+    (captures d'ecran, images, journaux, PDF - 6 Mo chacun au plus).
+    - POST /piece {name, mime, data en base64} rend un identifiant ; GET
+      /piece/<id> rend le fichier (type et nom dans les en-tetes).
+    - Le bus les garde sur disque (~/.local/share/tmuxv/pieces/<id>/<nom>)
+      et, en mode MariaDB, dans la table `pieces` : un autre tmuxv de la
+      meme base les sert a la premiere demande. Nettoyees apres 30 jours.
+    - Un message porte une ligne [piece:ID] par fichier. En le tapant chez
+      l'agent destinataire, tmuxv la remplace par le chemin local du fichier,
+      que l'agent lit tel quel (images comprises).
+  * MCP des agents (claude-agent-mcp) : send_message accepte des fichiers
+    joints ; get_attachment montre une piece a l'agent (les images
+    directement) ; screenshot capture une page web (Chrome sans affichage)
+    ou la console d'une conversation sous tmuxv, et peut l'envoyer aussitot.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Sat, 12 Sep 2026 09:30:00 +0100
+
+tmuxv (3.4+tmuxv13) unstable; urgency=high
+
+  * Mise a jour a chaud : le nouveau serveur plantait (strdup(NULL) dans
+    run-shell) des que la configuration relue contenait un `run` (tpm) et
+    qu'un client etait attache : les clients reconstruits n'avaient pas de
+    repertoire courant. C'est ce qui a arrete la production lors des
+    passages a tmuxv11 et tmuxv12 - le bus et MariaDB n'y etaient pour rien.
+    Les clients reconstruits recoivent le repertoire de leur session, et
+    server_client_get_cwd ne renvoie plus jamais NULL.
+  * Apres une mise a jour a chaud, le journal de plantage (~/.tmuxv-crash.log)
+    est de nouveau arme : le filet de l'echange le remplacait par l'action
+    par defaut, et un plantage ulterieur ne laissait aucune trace.
+  * Gestionnaire Claude : raccourci de « Tout selectionner » dans le menu
+    d'une conversation passe a 't' ('a' reste « Annoncer... »).
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Sat, 12 Sep 2026 08:40:00 +0100
+
+tmuxv (3.4+tmuxv12) unstable; urgency=high
+
+  * Arret par le systeme : un SIGTERM venu de l'exterieur (systemd a la
+    deconnexion quand le linger est desactive, extinction) garde le fichier
+    d'etat, et le demarrage suivant restaure sessions et conversations. Seul
+    kill-server (Tuer le serveur tmuxv) l'efface. Auparavant, une simple
+    deconnexion SSH faisait perdre toutes les conversations.
+  * Gestionnaire Claude : selection multiple. Ctrl+clic ajoute/retire,
+    Maj+clic ou Alt+clic selectionne une plage ; entrees de menu equivalentes
+    pour les terminaux qui gardent ces clics. Clic droit sur la selection :
+    message du bus a toutes, texte tape dans chacune, copier noms/chemins,
+    fermer ; pour les reprises : reprendre, copier les titres, supprimer.
+    Commandes claude-mark et claude-marked, format #{pane_claude_selected}.
+  * Consoles : le clic du milieu colle la selection (comme sous X11), y
+    compris quand le panneau est reste en mode copie apres la selection. La
+    selection a la souris inclut la case sous le pointeur (la derniere lettre
+    n'est plus perdue) ; au clavier, rien ne change.
+  * Parametres : fenetre refaite - sections, recherche, ajout et suppression
+    d'options (y compris @options et tableaux), aide de chaque option,
+    Appliquer, enregistrement fusionne dans ~/.tmux.conf.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Sat, 12 Sep 2026 08:30:00 +0100
+
+tmuxv (3.4+tmuxv11) unstable; urgency=medium
+
+  * Le bus d'agents est INTERNE au serveur tmuxv : plus de service externe.
+    Meme API HTTP que l'ancien service (le MCP des agents et les agents hors
+    tmuxv n'y voient aucune difference), servie sur la boucle d'evenements du
+    serveur.
+    - @bus-port (4319) : le premier port libre a partir de celui-ci, change a
+      chaud ; plusieurs tmuxv sur une machine ont chacun le leur.
+    - @bus-db : URL MariaDB (vide = messages en memoire). Toute requete passe
+      par un fil dedie : une base lente ou absente ne gele jamais le serveur.
+    - Base injoignable : le bus bascule en memoire et continue de livrer ; au
+      retour de la base, ce qui a ete ecrit entre-temps y est verse, une fois.
+    - Plusieurs tmuxv partageant la base communiquent entre eux, et tout
+      agent peut ecrire par le port de n'importe lequel.
+    - @bus-bind, @bus-token ; formats #{bus_port}, #{bus_mode}.
+  * Catalogue des sessions en base et restore-session (-l, -m, -n -s, -f) :
+    une session se restaure sur n'importe quel tmuxv, meme apres l'arret du
+    serveur qui l'hebergeait. Menu Fichier > Restaurer une session...
+  * Conversations Claude a identifiant EXACT : tmuxv lance « claude
+    --session-id » et relit l'identifiant sur la ligne de commande ; la
+    devinette par date de fichier ne sert plus qu'en dernier recours, et une
+    meme conversation n'est jamais rouverte dans deux panneaux.
+  * Mise a jour a chaud : TOUTES les options globales survivent a l'echange
+    (celles de la configuration et celles changees a chaud), et la
+    configuration est relue (raccourcis, plugins). Auparavant le nouveau
+    processus repartait des valeurs par defaut.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Fri, 11 Sep 2026 10:30:00 +0100
+
+tmuxv (3.4+tmuxv10) unstable; urgency=high
+
+  * Bus d'agents : le guetteur de courrier se rearme depuis la boucle
+    principale du serveur, quel que soit le chemin qui a cree le gestionnaire.
+    Apres une restauration a froid (redemarrage de la machine) avec une autre
+    fenetre a l'ecran, plus personne ne sondait le bus : les agents pouvaient
+    ecrire mais ne recevaient plus rien.
+  * Renommer une conversation est un RENOMMAGE pour le bus (/rename) : son
+    courrier non lu et ses salons suivent, l'ancienne adresse disparait et les
+    pairs restes dessus sont rediriges.
+  * La premiere releve d'une conversation LIVRE ce qui n'a jamais ete lu, au
+    lieu de se contenter de noter la position : le courrier arrive pendant que
+    personne ne livrait (redemarrage, renommage) etait saute pour toujours.
+    L'historique deja lu n'est toujours jamais rejoue.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Fri, 11 Sep 2026 08:30:00 +0100
+
+tmuxv (3.4+tmuxv9) unstable; urgency=low
+
+  * Mise a jour a chaud : les programmes plein ecran se redessinent. Le
+    nouveau serveur herite des terminaux mais pas de ce qui y etait dessine :
+    une conversation Claude au repos restait sur un panneau BLANC, donc jamais
+    vue "a son invite", donc plus jamais livree. Un SIGWINCH a taille
+    identique ne suffisait pas ; le terminal est raccourci d'une ligne puis
+    rendu a sa taille.
+  * Mise a jour a chaud et restauration : le guetteur de courrier est relance.
+    Il n'etait arme qu'a la CREATION d'un gestionnaire : une fenetre
+    reconstruite revenait avec personne pour sonder le bus.
+  * Renommer une conversation lui conserve son projet (groupe) et son statut
+    de conversation livree par tmuxv. Sans cela elle sortait de son groupe -
+    une diffusion « * » ne l'atteignait plus.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Thu, 10 Sep 2026 13:40:00 +0100
+
+tmuxv (3.4+tmuxv8) unstable; urgency=low
+
+  * Gestionnaire Claude Code : l'adresse de bus d'une conversation RENOMMEE
+    survit desormais a une mise a jour a chaud et a une restauration apres
+    crash. Elle ne vivait qu'en memoire : apres un echange de binaire, chaque
+    conversation retombait sur son nom de naissance et son courrier, adresse
+    au nom choisi, n'arrivait plus jamais.
+  * Memoire : le groupe (cgroup) d'un panneau porte le numero de son
+    PROCESSUS et non celui du panneau, que la mise a jour a chaud renumerote.
+    Le serveur retrouve donc toujours le bon groupe - il pouvait auparavant
+    ecrire dans celui d'un autre panneau, et pousser en swap une conversation
+    affichee. Le chemin est de plus relu depuis le processus lui-meme, et les
+    groupes vides d'une vie anterieure sont balayes au demarrage.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Thu, 10 Sep 2026 12:10:00 +0100
+
+tmuxv (3.4+tmuxv7) unstable; urgency=low
+
+  * Menu Fichier : « Quitter tmux » devient « Tuer le serveur tmuxv », la
+    confirmation aussi - le nom disait mal ce que fait l'entree.
+  * Mise a jour a chaud : quand le serveur ne peut pas remonter dans son
+    groupe memoire (une version anterieure y avait laisse un groupe, et un
+    cgroup ne peut plus recevoir de processus des qu'il delegue a ses
+    enfants), il reste ou il est et prend son parent comme base au lieu de
+    renoncer au swap pour toute la vie du serveur.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Thu, 10 Sep 2026 10:40:00 +0100
+
+tmuxv (3.4+tmuxv6) unstable; urgency=low
+
+  * Mise a jour a chaud : le serveur retrouve exactement le meme groupe
+    memoire qu'avant l'echange. Il ne s'enfonce plus d'un niveau (correction
+    partielle de la version precedente) et, surtout, les panneaux ouverts
+    AVANT la mise a jour gardent un groupe que le serveur sait retrouver -
+    donc ils restent poussables en swap.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Thu, 10 Sep 2026 08:45:00 +0100
+
+tmuxv (3.4+tmuxv5) unstable; urgency=low
+
+  * Mise a jour a chaud : le nom du programme d'un panneau
+    (#{pane_current_command}, barre de statut, renommage automatique) ne
+    revient plus vide apres l'echange de binaire.
+  * Mise a jour a chaud : le serveur ne s'enfonce plus d'un niveau de cgroup
+    a chaque echange (tmuxv-server/tmuxv-server/...) ; la portee deja
+    obtenue aupres de systemd est reutilisee.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Thu, 10 Sep 2026 08:30:00 +0100
+
+tmuxv (3.4+tmuxv4) unstable; urgency=low
+
+  * Bureau : un double clic sur la barre de titre agrandit la fenetre au
+    bureau entier, un second lui rend sa taille et sa place d'avant, comme
+    partout ailleurs. La case [^] garde son role au clic simple.
+  * Gestionnaire Claude Code : la section « Reprendre » ne montre plus que
+    les conversations du repertoire ou se trouve la console affichee - un
+    « cd » est suivi immediatement - et celles qui tournent deja n'y sont
+    plus proposees.
+  * Gestionnaire Claude Code : clic droit sur une reprise -> reprendre,
+    copier le titre, ou supprimer definitivement (le fichier de
+    transcription est efface, apres confirmation). Nouvelle commande
+    claude-session -r|-d <uuid>.
+  * Alerte de memoire basse : elle s'adresse a qui REGARDE le gestionnaire, et
+    la limite d'une fois par minute ne court qu'une fois l'alerte affichee -
+    un gestionnaire que personne ne regarde la consommait sans rien montrer.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Thu, 10 Sep 2026 07:40:00 +0100
+
+tmuxv (3.4+tmuxv3) unstable; urgency=low
+
+  * Panneaux inactifs pousses en swap sous pression memoire (@swap-idle) : le
+    serveur obtient tout seul une portee cgroup deleguee aupres de systemd ;
+    le panneau affiche n'est jamais touche. Sans systemd, sans effet.
+  * Sondage du bus d'agents : la boite aux lettres n'est relevee que s'il y a
+    du courrier (/agents donne deja le compte). Au repos, plus aucun curl.
+  * Bus : les diffusions "*" restent dans le projet (groupe) au lieu d'arroser
+    tous les agents ; "**" pour tout le bus. Les agents disparus depuis plus
+    d'une heure sont masques. tmuxv se declare livreur, donc les agents n'ont
+    plus a relever leur boite et ne voient plus deux fois le meme message.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Thu, 10 Sep 2026 06:10:00 +0100
+
+tmuxv (3.4+tmuxv2) unstable; urgency=low
+
+  * Mise a jour a chaud : "tmuxv upgrade-server" remplace le binaire sans tuer
+    les processus des panneaux (execve conserve pid et descripteurs). Filet de
+    repli : si la nouvelle version meurt en reconstruisant, l'ancienne, copiee
+    de cote avant l'exec, reprend la main avec le meme etat.
+  * Restauration apres plantage : instantane periodique dans ~/.tmuxv-state
+    (options @restore, @restore-interval). Un arret propre efface le fichier,
+    donc un fichier present au demarrage prouve le plantage. Les panneaux
+    reviennent en shells ; les conversations Claude reviennent SUR elles-memes
+    (claude --resume).
+  * Memoire : les processus des panneaux sont les victimes preferees du tueur
+    OOM (@oom-score), chaque conversation affiche ce qu'elle pese, et une
+    alerte s'affiche sous @memory-warn Mo disponibles.
+  * Gestionnaire Claude : section "Reprendre" (double-clic pour rouvrir une
+    conversation), ascenseur vertical quand la liste deborde, annonce
+    declenchee par l'utilisateur dans une zone de texte multi-lignes, et plus
+    aucune annonce automatique.
+  * Corrections : plus de ligne "curl" dans une nouvelle conversation ;
+    "Renommer" du menu contextuel etait casse (les %1..%9 d'un modele
+    command-prompt ecrasaient la cible) ; fermer la derniere fenetre laisse un
+    bureau vide au lieu d'arreter tmux ; demarrage en mode fenetre par defaut.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Thu, 10 Sep 2026 05:00:00 +0100
+
+tmuxv (3.4+tmuxv1) unstable; urgency=low
+
+  * Premier paquet du fork tmuxv, base sur tmux 3.4.
+  * Interface Turbo Vision : barre de menu, bureau fenetre, dialogues,
+    boutons, ascenseurs a repetition automatique.
+  * Gestionnaire de conversations Claude Code (fenetre claude-manager) avec
+    bus de communication entre agents.
+  * Corrections par rapport a tmux 3.4 amont : double liberation dans
+    window_destroy() via window_unzoom(), fuite des sequences OSC au
+    demarrage, collage et frappe avalees par le mode copie.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>  Fri, 04 Sep 2026 19:00:00 +0100

@@ -1,0 +1,121 @@
+tmuxv - tmux 3.4 avec une interface Turbo Vision
+================================================
+
+Fork personnel de tmux 3.4. Le binaire s'appelle tmuxv, la page de manuel
+tmuxv(1) : le paquet tmux de la distribution n'est pas touche et les deux
+peuvent tourner en meme temps.
+
+ATTENTION : tmuxv utilise la meme socket par defaut que tmux (« default »).
+Un « tmuxv kill-server » tue donc aussi les sessions tmux ordinaires. Pour
+travailler a l'ecart, utiliser une socket dediee : tmuxv -S /tmp/ma-socket.
+
+
+Activer l'interface
+-------------------
+
+Dans ~/.tmux.conf (ou le fichier passe a -f) :
+
+    set -g @menu-bar on      # barre de menu deroulante en haut
+    set -g @desktop  on      # bureau : chaque fenetre dans un cadre
+
+Options :
+
+    @menu-bar          on|off   affiche la barre de menu
+    @desktop           on|off   affiche le bureau fenetre
+    @menu-bar-format   chaine   contenu de la partie droite de la barre
+
+Raccourcis (apres la touche prefixe, C-b par defaut) :
+
+    B    active/desactive la barre de menu
+    F    active/desactive le bureau fenetre
+
+Quand le bureau est actif, les commandes qui affichent une liste ou posent
+une question s'ouvrent dans une boite de dialogue au lieu de la ligne de
+statut : prefixe s (sessions), w (fenetres), = et # (presse-papiers),
+? (raccourcis), ~ (journal).
+
+
+Souris
+------
+
+    glisser              selectionne du texte ; la selection reste affichee
+    taper / coller       efface la selection et va au programme
+    clic droit           menu du panneau (Copier, Coller, splits, zoom...)
+    bord / coin          deplace ou redimensionne la fenetre
+    double clic titre    agrandit la fenetre au bureau entier, un second
+                         double clic lui rend sa taille et sa place
+    colonne de droite    ascenseur ; la bande a sa droite redimensionne
+                         les splits ; maintenir un clic sur les fleches
+                         fait defiler en continu
+
+
+Commandes ajoutees
+------------------
+
+    display-form        boite de dialogue de saisie
+    display-log         journal des messages du serveur
+    display-windows     liste des fenetres, en dialogue
+    display-buffers     liste des presse-papiers, en dialogue
+    display-sessions    liste des sessions, en dialogue
+    display-keys        liste des raccourcis, en dialogue
+    claude-manager      ouvre le gestionnaire de conversations Claude Code
+    claude-new-dir      nouvelle conversation dans un repertoire choisi
+    claude-rename       renomme la conversation courante
+    claude-announce     annonce la conversation sur le bus (boite editable)
+    claude-session      -r reprend une conversation sauvegardee,
+                        -d la supprime definitivement
+
+
+Gestionnaire de conversations Claude Code
+-----------------------------------------
+
+La fenetre creee par claude-manager affiche a gauche la liste des
+conversations (colonne redimensionnable) et a droite la conversation
+active ; chaque conversation est un panneau. « + Nouvelle » ouvre un shell
+dans le repertoire courant, et un clic droit sur une ligne donne un menu
+(renommer, fermer...).
+
+Sous la liste, « Reprendre » montre les conversations SAUVEGARDEES du
+repertoire ou se trouve la console affichee : un « cd » y est suivi
+immediatement, et les conversations deja ouvertes n'y figurent pas. Un
+double clic en relance une (claude --resume), un clic droit donne le menu
+(reprendre, copier le titre, supprimer definitivement - la suppression
+efface le fichier de transcription et demande confirmation).
+
+Les agents Claude d'un meme gestionnaire peuvent echanger des messages en
+temps reel, par le bus d'agents INTERNE au serveur tmuxv (API HTTP, port
+@bus-port = 4319 ou le premier libre apres). Il faut le binaire
+claude-agent-mcp installe (cherche entre autres dans /usr/local/bin), que
+les agents lancent comme serveur MCP.
+
+    @bus            on|off   le bus interne
+    @bus-port       4319     premier port essaye, change a chaud
+    @bus-bind       0.0.0.0  adresse d'ecoute
+    @bus-db         ''       MariaDB, par ex.
+                             mysql:///claude_agent?socket=/run/mysqld/mysqld.sock
+                             (sans utilisateur : le compte systeme, via
+                             unix_socket, aucun mot de passe a stocker)
+    @bus-token      ''       jeton exige dans X-Agent-Token s'il est pose
+
+Sans base, les messages restent en memoire : les conversations de ce
+serveur communiquent toujours. Avec une base partagee, plusieurs tmuxv
+communiquent entre eux et chaque session est inscrite au catalogue :
+restore-session -l (liste), -m (menu), -n noeud -s session [-f]. Chaque conversation recoit un
+nom d'agent dans AGENT_NAME ; elle n'est annoncee sur le bus que lorsque
+l'utilisateur le demande (menu « Annoncer... », le texte reste modifiable
+avant l'envoi). Un « v » dans la liste signale des messages non lus. Sans
+ce serveur, tmuxv fonctionne normalement, seule la communication entre
+agents est inactive.
+
+
+Differences avec tmux 3.4 amont, hors interface
+-----------------------------------------------
+
+  * correction d'une double liberation dans window_destroy() (window_unzoom
+    notifiait une fenetre en cours de destruction) ;
+  * correction des reponses OSC/DCS partielles laissant des caracteres
+    parasites a l'ecran au demarrage ;
+  * un collage ou une frappe ne sont plus avales par le mode copie quand
+    celui-ci ne sert qu'a afficher une selection faite a la souris.
+
+ -- Martinien Olinga <martinien.olinga@gmail.com>

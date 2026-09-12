@@ -1,0 +1,17 @@
+Package: tmuxv
+Version: 3.4+tmuxv16
+Section: misc
+Priority: optional
+Architecture: amd64
+Depends: libc6 (>= 2.38), libevent-core-2.1-7t64 (>= 2.1.8-stable), libtinfo6 (>= 6.4+20230603), libtinfo6 (<< 6.5~)
+Suggests: tmux
+Maintainer: Martinien Olinga <martinien.olinga@gmail.com>
+Homepage: https://github.com/tmux/tmux
+Description: multiplexeur de terminal avec une interface Turbo Vision
+ tmuxv est un fork personnel de tmux 3.4 qui ajoute une interface fenetree
+ dans l'esprit de Turbo Vision : barre de menu deroulante, bureau avec
+ fenetres deplacables et redimensionnables, boites de dialogue, boutons,
+ ascenseurs et un gestionnaire de conversations Claude Code.
+ .
+ Le binaire s'appelle tmuxv et la page de manuel tmuxv(1) : le paquet
+ cohabite avec le paquet tmux de la distribution, qui reste intact.

@@ -966,6 +966,13 @@ struct screen_redraw_ctx {
 	u_int		 statuslines;
 	int		 statustop;
 
+	u_int		 menubar; /* MENU BAR: extra top line (0 or 1) */
+
+	u_int		 desktop_top;   /* DESKTOP: inset above window content */
+	u_int		 desktop_left;  /* DESKTOP: inset left of window content */
+	u_int		 desktop_vert;  /* DESKTOP: total top+bottom inset */
+	u_int		 desktop_horiz; /* DESKTOP: total left+right inset */
+
 	int		 pane_status;
 	enum pane_lines	 pane_lines;
 
@@ -1126,6 +1133,19 @@ struct window_pane {
 	TAILQ_HEAD(, window_mode_entry) modes;
 
 	char		*searchstr;
+
+	/* CLAUDE: agent bus (claude-agent-server) identity and mail state. */
+	char		*claude_agent;	/* AGENT_NAME, read from the child */
+	u_int		 claude_pending;/* last "pending" seen on the bus */
+	u_int		 claude_cursor;	/* last bus message delivered here */
+	int		 claude_cursor_ok;/* cursor initialised (no backlog) */
+	int		 claude_fetching;/* an inbox fetch is in flight */
+	int		 drag_selection;/* copy mode entered by a mouse drag */
+	int		 claude_briefed;/* the agent here knows who it is */
+	int		 claude_seen;	/* pending has been sampled once */
+	int		 claude_unread;	/* pending grew since last displayed */
+	u_int		 claude_mem;	/* MEMORY: agent + children, in KB */
+	int		 claude_marked;	/* part of the list's multi-selection */
 	int		 searchregex;
 
 	int		 border_gc_set;
@@ -1167,6 +1187,31 @@ struct window {
 	u_int			 manual_sy;
 	u_int			 xpixel;
 	u_int			 ypixel;
+
+	/* DESKTOP: floating window rectangle (desktop-area coords). */
+	u_int			 desktop_x;
+	u_int			 desktop_y;
+	u_int			 desktop_w;
+	u_int			 desktop_h;
+	int			 desktop_zoomed;	/* maximised */
+	int			 desktop_ph;		/* empty-desktop placeholder */
+	int			 claude_sel_sess;	/* highlighted saved session */
+	u_int			 claude_anchor;		/* range start: pane id + 1 */
+	int			 claude_anchor_sess;	/* range start: saved row */
+	u_int			 claude_scroll;		/* list scroll offset */
+	int			 claude_lowmem;		/* MEMORY: machine is short */
+	u_int			 desktop_zx, desktop_zy, desktop_zw, desktop_zh;
+	size_t			 desktop_last_used; /* output seen, for liveness */
+
+	/*
+	 * CLAUDE: conversation-manager window. Each pane is one conversation;
+	 * the window stays zoomed on the active one (the others keep running,
+	 * hidden) and a native list column is drawn on the left.
+	 */
+	int			 claude_mgr;
+	u_int			 claude_listw;	/* list column width, 0 = default */
+	u_int			 claude_seq;	/* names conversations uniquely */
+	char			*claude_roster;	/* agents present, last announced */
 
 	u_int			 new_sx;
 	u_int			 new_sy;
@@ -1353,6 +1398,9 @@ struct mouse_event {
 
 	int		statusat;
 	u_int		statuslines;
+
+	u_int		mtop;	/* MENU BAR + DESKTOP: rows above the pane area */
+	u_int		mleft;	/* DESKTOP: columns left of the pane area */
 
 	u_int		x;
 	u_int		y;
@@ -1822,6 +1870,34 @@ struct client {
 
 	struct status_line	 status;
 
+	struct style_ranges	 menubar_ranges; /* MENU BAR: clickable zones */
+
+	/* DESKTOP: Turbo Vision style back-buffer for damage-based drawing. */
+	struct screen		 desktop_buffer;
+	int			 desktop_buffer_valid;
+
+	/* DESKTOP: floating window rectangle (in desktop-area coords). */
+	u_int			 desktop_x;
+	u_int			 desktop_y;
+	u_int			 desktop_w;
+	u_int			 desktop_h;
+	int			 desktop_dragging;
+	int			 desktop_resizing;
+	int			 claude_band_drag;	/* list column being resized */
+	/* Desktop scrollbar: held arrow auto-repeat / thumb drag (TVision). */
+	struct event		 desktop_sb_timer;
+	int			 desktop_sb_mode;	/* 0 none, 1 arrow, 2 thumb */
+	int			 desktop_sb_list;	/* the bar is the Claude list */
+	int			 desktop_sb_dir;	/* -1 ▲ older, +1 ▼ */
+	int			 desktop_sb_on;		/* mouse still on the arrow */
+	u_int			 desktop_sb_ax;
+	u_int			 desktop_sb_ay;
+	u_int			 desktop_sb_wpid;	/* pane whose bar is used */
+	u_int			 desktop_sb_by;		/* its bar: top row, size */
+	u_int			 desktop_sb_bsize;
+	u_int			 desktop_drag_dx;
+	u_int			 desktop_drag_dy;
+
 #define CLIENT_TERMINAL 0x1
 #define CLIENT_LOGIN 0x2
 #define CLIENT_EXIT 0x4
@@ -1917,6 +1993,7 @@ struct client {
 #define PROMPT_KEY 0x10
 	int			 prompt_flags;
 	enum prompt_type	 prompt_type;
+	int			 prompt_dialog;	/* prompt shown in a TVision box */
 	int			 prompt_cursor;
 
 	struct session		*session;
@@ -2773,6 +2850,95 @@ void	 status_timer_start_all(void);
 void	 status_update_cache(struct session *);
 int	 status_at_line(struct client *);
 u_int	 status_line_size(struct client *);
+u_int	 menu_bar_size(struct client *); /* MENU BAR */
+const char *menu_bar_format(struct client *); /* MENU BAR */
+struct style_range *menu_bar_get_range(struct client *, u_int); /* MENU BAR */
+void	 status_free_ranges(struct style_ranges *); /* MENU BAR */
+char	*menu_bar_build(void); /* MENU BAR: rendered format string */
+void	 menu_bar_open(struct client *, u_int, u_int); /* MENU BAR: dropdown */
+/* Turbo Vision menu palette (menu bar dropdowns and desktop menus). */
+#define MENU_BAR_MENU_STYLE	"bg=#c0c0c0,fg=#000000"
+#define MENU_BAR_SELECTED_STYLE	"bg=#00a800,fg=#000000"
+#define MENU_BAR_BORDER_STYLE	"bg=#c0c0c0,fg=#000000"
+int	 menu_bar_key(struct client *, key_code); /* MENU BAR: Alt+mnemonic */
+int	 desktop_inset(struct client *, u_int *, u_int *, u_int *, u_int *);
+int	 desktop_enabled(struct client *); /* DESKTOP */
+int	 desktop_get_area(struct client *, u_int *, u_int *);
+void	 desktop_toggle_zoom(struct client *, struct window *);
+int	 desktop_pane_scrollbar(struct client *, struct window_pane *, u_int,
+	     u_int, u_int, u_int, u_int *, u_int *, u_int *);
+/* CLAUDE: conversation manager window. */
+#define CLAUDE_LISTW 22
+int	 claude_manager(struct window *);
+u_int	 claude_list_width(struct client *, struct window *);
+u_int	 claude_inset(struct client *, struct window *);
+/* CLAUDE: rows of the manager list, shared by the drawing and the mouse. */
+enum claude_row {
+	CLAUDE_ROW_NONE,
+	CLAUDE_ROW_HEADER,
+	CLAUDE_ROW_CONV,
+	CLAUDE_ROW_SESSHDR,
+	CLAUDE_ROW_SESS,
+	CLAUDE_ROW_NEW
+};
+enum claude_row claude_list_row(struct client *, struct window *, u_int,
+	     u_int *);
+int	 claude_list_geom(struct client *, struct window *, u_int *, u_int *,
+	     u_int *);
+int	 claude_list_scrollbar(struct client *, struct window *, u_int, u_int,
+	     u_int, u_int, u_int *, u_int *, u_int *);
+void	 claude_list_scroll(struct window *, int);
+void	 claude_list_scroll_to(struct window *, u_int, u_int);
+void	 claude_resume(struct client *, u_int);
+
+/* CLAUDE: past conversations that can be resumed from the manager. */
+void	 claude_announce_default(struct window_pane *, char *, size_t);
+void	 claude_announce_box(struct client *, struct window_pane *, const char *);
+void	 claude_mem_sample(void);                       /* MEMORY */
+u_int	 claude_mem_total(struct window *);              /* MEMORY, KB */
+void	 claude_sess_scan(const char *);
+void	 claude_sess_refresh(struct window *);
+u_int	 claude_sess_count(void);
+const char *claude_sess_label(u_int);
+const char *claude_sess_id(u_int);
+
+int	 desktop_session_on(struct session *);              /* DESKTOP */
+int	 desktop_keep_window(struct window *);            /* DESKTOP */
+void	 desktop_make_placeholder(struct window *);       /* DESKTOP */
+int	 desktop_placeholder(struct window *);            /* DESKTOP */
+void	 claude_select_row(struct client *, struct window *, u_int);
+int	 claude_fix_zoom(struct window *);
+void	 claude_hidden_fit(struct window *);
+void	 server_set_crash_handler(void);
+void	 claude_new_shell(struct client *);
+void	 claude_row_menu(struct client *, struct window *, u_int, u_int, u_int);
+void	 claude_sess_menu(struct client *, u_int, u_int, u_int);
+void	 claude_list_click(struct client *, struct window *,
+	     enum claude_row, u_int, int, u_int, u_int, u_int);
+int	 claude_sess_marked(u_int);
+/* CLAUDE: agent bus (see /home/martinien/claude-agent-server). */
+const char	*claude_bus_url(void);
+const char	*claude_agent_name(struct window_pane *);
+void		 claude_bus_poll(void);
+void		 claude_bus_start(void);
+void		 claude_mark_read(struct window_pane *);
+void	 claude_new_dialog(struct client *);	/* claude-new-dir */
+extern const struct cmd_entry cmd_claude_entry;
+extern const struct cmd_entry cmd_claude_dir_entry;
+extern const struct cmd_entry cmd_claude_announce_entry;
+extern const struct cmd_entry cmd_claude_session_entry;
+extern const struct cmd_entry cmd_claude_rename_entry;
+extern const struct cmd_entry cmd_claude_mark_entry;
+extern const struct cmd_entry cmd_claude_marked_entry;
+int	 desktop_get_rect(struct client *, u_int *, u_int *, u_int *, u_int *);
+int	 desktop_get_rect_w(struct client *, struct window *, u_int *, u_int *,
+	    u_int *, u_int *);
+u_int	 desktop_top(struct client *);   /* DESKTOP */
+u_int	 desktop_left(struct client *);  /* DESKTOP */
+u_int	 desktop_vert(struct client *);  /* DESKTOP */
+u_int	 desktop_horiz(struct client *); /* DESKTOP */
+u_int	 desktop_vert_w(struct client *, struct window *);  /* DESKTOP */
+u_int	 desktop_horiz_w(struct client *, struct window *); /* DESKTOP */
 struct style_range *status_get_range(struct client *, u_int, u_int);
 void	 status_init(struct client *);
 void	 status_free(struct client *);
@@ -3011,6 +3177,52 @@ void	 screen_reset_hyperlinks(struct screen *);
 void	 screen_set_cursor_style(u_int, enum screen_cursor_style *, int *);
 void	 screen_set_cursor_colour(struct screen *, int);
 int	 screen_set_title(struct screen *, const char *);
+
+/* upgrade.c: replace the binary without killing what it runs */
+extern const char *server_upgrade_file;
+extern int	 server_upgrade_socket;
+extern char	*server_binary_path;
+int		 server_upgrade_socket_fd(void);
+int		 proc_peer_fd(struct tmuxpeer *);
+int		 upgrade_exec(const char *, char **);
+int		 upgrade_peek_socket(const char *);
+void		 upgrade_fallback(void);
+void		 upgrade_save_start(void);
+void		 upgrade_save_clean(void);
+void		 upgrade_save_keep(void);
+extern int	 server_kill_asked;
+int		 upgrade_restore_cold(void);
+
+/* swapmem.c: push the panes nobody is looking at out to swap */
+void		 swap_init(void);
+int		 swap_available(void);
+void		 swap_start(void);
+/* bus.c - the agent bus, inside the server */
+void		 bus_init(struct event_base *);
+int		 bus_port(void);
+const char	*bus_mode(void);
+const char	*bus_mode_reason(void);
+const char	*bus_piece_local(const char *);
+void		 claude_bus_resync(void);
+void		 bus_snapshot_put(const char *, const char *, const char *,
+		     u_int, u_int, const char *);
+void		 bus_snapshot_prune(const char *, const char *);
+void		 bus_snapshot_list(void (*)(const char *, const char *, void *),
+		     void *);
+void		 bus_snapshot_get(const char *, const char *,
+		     void (*)(const char *, const char *, void *), void *);
+int		 claude_pane_session_uuid(struct window_pane *, char *, size_t);
+char		*upgrade_cold_text(struct session *, u_int *, u_int *);
+const char	*upgrade_node_name(void);
+int		 upgrade_restore_text(const char *, char **, char **);
+
+void		 swap_pane_join(void);
+void		 swap_pane_free(pid_t);
+int		 upgrade_enabled(void);
+extern const char *server_upgrade_fallback;
+void		 upgrade_load(const char *);
+extern const struct cmd_entry cmd_upgrade_server_entry;
+extern const struct cmd_entry cmd_restore_session_entry;
 void	 screen_set_path(struct screen *, const char *);
 void	 screen_push_title(struct screen *);
 void	 screen_pop_title(struct screen *);
@@ -3227,6 +3439,9 @@ void printflike(3, 4) window_copy_add(struct window_pane *, int, const char *,
 void printflike(3, 0) window_copy_vadd(struct window_pane *, int, const char *,
 		     va_list);
 void		 window_copy_pageup(struct window_pane *, int);
+int		 window_copy_get_scroll(struct window_pane *, u_int *, u_int *,
+		     u_int *); /* SCROLLBAR */
+void		 window_copy_set_scroll(struct window_pane *, u_int); /* SCROLLBAR */
 void		 window_copy_start_drag(struct client *, struct mouse_event *);
 char		*window_copy_get_word(struct window_pane *, u_int, u_int);
 char		*window_copy_get_line(struct window_pane *, u_int);
@@ -3381,6 +3596,9 @@ struct menu_data *menu_prepare(struct menu *, int, int, struct cmdq_item *,
 		    u_int, u_int, struct client *, enum box_lines, const char *,
 		    const char *, const char *, struct cmd_find_state *,
 		    menu_choice_cb, void *);
+int		 menu_display_menubar(struct menu *, int, struct cmdq_item *,
+		    u_int, u_int, struct client *, enum box_lines, const char *,
+		    const char *, const char *, struct cmd_find_state *, u_int);
 int		 menu_display(struct menu *, int, int, struct cmdq_item *,
 		    u_int, u_int, struct client *, enum box_lines, const char *,
 		    const char *, const char *, struct cmd_find_state *,
@@ -3392,6 +3610,23 @@ void		 menu_draw_cb(struct client *, void *,
 		    struct screen_redraw_ctx *);
 void		 menu_free_cb(struct client *, void *);
 int		 menu_key_cb(struct client *, void *, struct key_event *);
+void		 form_display(struct client *, struct cmdq_item *); /* PARAMS */
+void		 confirm_dialog(struct client *, const char *, const char *,
+		     prompt_input_cb, prompt_free_cb, void *);
+int		 prompt_dialog_open(struct client *);
+void		 message_dialog(struct client *, const char *, int);
+extern const struct cmd_entry cmd_dwindows_entry;
+extern const struct cmd_entry cmd_dbuffers_entry;
+extern const struct cmd_entry cmd_dmessages_entry;
+u_int		 scrollbar_pos(u_int, u_int, u_int);	/* TVision TScrollBar */
+u_int		 scrollbar_value(u_int, u_int, u_int);
+void		 scrollbar_draw(struct screen_write_ctx *, u_int, u_int, u_int,
+		     u_int, u_int, int, int);
+/* PARAMS: about / keys / commands / sessions dialogs */
+extern const struct cmd_entry cmd_about_entry;
+extern const struct cmd_entry cmd_dkeys_entry;
+extern const struct cmd_entry cmd_dcommands_entry;
+extern const struct cmd_entry cmd_dsessions_entry;
 
 /* popup.c */
 #define POPUP_CLOSEEXIT 0x1

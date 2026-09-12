@@ -44,6 +44,11 @@ extern const struct cmd_entry cmd_customize_mode_entry;
 extern const struct cmd_entry cmd_delete_buffer_entry;
 extern const struct cmd_entry cmd_detach_client_entry;
 extern const struct cmd_entry cmd_display_menu_entry;
+extern const struct cmd_entry cmd_settings_entry;
+extern const struct cmd_entry cmd_about_entry;
+extern const struct cmd_entry cmd_dkeys_entry;
+extern const struct cmd_entry cmd_dcommands_entry;
+extern const struct cmd_entry cmd_dsessions_entry;
 extern const struct cmd_entry cmd_display_message_entry;
 extern const struct cmd_entry cmd_display_popup_entry;
 extern const struct cmd_entry cmd_display_panes_entry;
@@ -138,6 +143,21 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_delete_buffer_entry,
 	&cmd_detach_client_entry,
 	&cmd_display_menu_entry,
+	&cmd_settings_entry,
+	&cmd_about_entry,
+	&cmd_dkeys_entry,
+	&cmd_dcommands_entry,
+	&cmd_claude_entry,
+	&cmd_claude_dir_entry,
+	&cmd_claude_announce_entry,
+	&cmd_claude_session_entry,
+	&cmd_claude_rename_entry,
+	&cmd_claude_mark_entry,
+	&cmd_claude_marked_entry,
+	&cmd_dsessions_entry,
+	&cmd_dwindows_entry,
+	&cmd_dbuffers_entry,
+	&cmd_dmessages_entry,
 	&cmd_display_message_entry,
 	&cmd_display_popup_entry,
 	&cmd_display_panes_entry,
@@ -210,6 +230,8 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_switch_client_entry,
 	&cmd_unbind_key_entry,
 	&cmd_unlink_window_entry,
+	&cmd_upgrade_server_entry,
+	&cmd_restore_session_entry,
 	&cmd_wait_for_entry,
 	NULL
 };
@@ -765,6 +787,18 @@ cmd_mouse_at(struct window_pane *wp, struct mouse_event *m, u_int *xp,
 
 	if (m->statusat == 0 && y >= m->statuslines)
 		y -= m->statuslines;
+
+	/* MENU BAR + DESKTOP: account for the rows/cols reserved above/left. */
+	if (m->mtop != 0) {
+		if (y < m->mtop)
+			return (-1);
+		y -= m->mtop;
+	}
+	if (m->mleft != 0) {
+		if (x < m->mleft)
+			return (-1);
+		x -= m->mleft;
+	}
 
 	if (x < wp->xoff || x >= wp->xoff + wp->sx)
 		return (-1);

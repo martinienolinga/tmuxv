@@ -54,7 +54,7 @@ usage(void)
 {
 	fprintf(stderr,
 	    "usage: %s [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n"
-	    "            [-S socket-path] [-T features] [command [flags]]\n",
+	    "            [-p pid] [-S socket-path] [-T features] [command [flags]]\n",
 	    getprogname());
 	exit(1);
 }
@@ -235,6 +235,77 @@ fail:
 	return (NULL);
 }
 
+/*
+ * Resolve a server PID to its socket path, so a client can attach (or run any
+ * command) by PID: read /proc/<pid>/cmdline and pick out -S <path> or
+ * -L <label> (falling back to a "tmux: server (<path>)" title, or the default
+ * socket). Lets `tmuxv -p <pid> attach` / `-p <pid> ls` work.
+ */
+static char *
+path_from_pid(const char *pidstr, char **cause)
+{
+	const char	*errstr;
+	long long	 pid;
+	char		 file[64], buf[8192];
+	char		*args[64], *label = NULL, *spath = NULL, *op, *cp;
+	int		 fd, nargs = 0;
+	ssize_t		 got;
+	size_t		 i, start;
+
+	*cause = NULL;
+	pid = strtonum(pidstr, 1, 4294967295LL, &errstr);
+	if (errstr != NULL) {
+		xasprintf(cause, "pid %s is %s", pidstr, errstr);
+		return (NULL);
+	}
+	xsnprintf(file, sizeof file, "/proc/%lld/cmdline", pid);
+	if ((fd = open(file, O_RDONLY)) == -1) {
+		xasprintf(cause, "no process %lld (%s)", pid, strerror(errno));
+		return (NULL);
+	}
+	got = read(fd, buf, sizeof buf - 1);
+	close(fd);
+	if (got <= 0) {
+		xasprintf(cause, "cannot read command line of pid %lld", pid);
+		return (NULL);
+	}
+	buf[got] = '\0';
+
+	/* Split the NUL-separated argv. */
+	start = 0;
+	for (i = 0; i <= (size_t)got && nargs < 63; i++) {
+		if (buf[i] == '\0') {
+			if (i > start)
+				args[nargs++] = buf + start;
+			start = i + 1;
+		}
+	}
+	/* Look for -S <path> / -L <label> (also combined -Sxxx / -Lxxx). */
+	for (i = 0; i < (size_t)nargs; i++) {
+		if (strcmp(args[i], "-S") == 0 && i + 1 < (size_t)nargs)
+			spath = args[++i];
+		else if (strncmp(args[i], "-S", 2) == 0 && args[i][2] != '\0')
+			spath = args[i] + 2;
+		else if (strcmp(args[i], "-L") == 0 && i + 1 < (size_t)nargs)
+			label = args[++i];
+		else if (strncmp(args[i], "-L", 2) == 0 && args[i][2] != '\0')
+			label = args[i] + 2;
+	}
+	if (spath != NULL)
+		return (xstrdup(spath));
+
+	/* Fallback: a setproctitle-style "server (<path>)" command line. */
+	if (label == NULL && (op = strstr(buf, "server (")) != NULL) {
+		op += 8;
+		if ((cp = strchr(op, ')')) != NULL) {
+			*cp = '\0';
+			return (xstrdup(op));
+		}
+	}
+	/* Resolve the -L label (or the default socket) to a path. */
+	return (make_label(label, cause));
+}
+
 void
 setblocking(int fd, int state)
 {
@@ -339,6 +410,23 @@ main(int argc, char **argv)
 	const struct options_table_entry	*oe;
 	u_int					 i;
 
+	/*
+	 * HOT UPGRADE: remember where this binary lives NOW, while the file is
+	 * still the one we were started from. After a package upgrade,
+	 * /proc/self/exe points at the replaced (deleted) inode instead.
+	 */
+	{
+		char	rlbuf[PATH_MAX];
+		ssize_t	rln;
+
+		rln = readlink("/proc/self/exe", rlbuf, sizeof rlbuf - 1);
+		if (rln > 0) {
+			rlbuf[rln] = '\0';
+			server_binary_path = xstrdup(rlbuf);
+		} else if (argv[0] != NULL)
+			server_binary_path = xstrdup(argv[0]);
+	}
+
 	if (setlocale(LC_CTYPE, "en_US.UTF-8") == NULL &&
 	    setlocale(LC_CTYPE, "C.UTF-8") == NULL) {
 		if (setlocale(LC_CTYPE, "") == NULL)
@@ -361,8 +449,19 @@ main(int argc, char **argv)
 		environ_set(global_environ, "PWD", 0, "%s", cwd);
 	expand_paths(TMUX_CONF, &cfg_files, &cfg_nfiles, 1);
 
-	while ((opt = getopt(argc, argv, "2c:CDdf:lL:NqS:T:uUvV")) != -1) {
+	while ((opt = getopt(argc, argv, "2c:CDdf:F:lL:Np:qR:S:T:uUvV")) != -1) {
 		switch (opt) {
+		case 'F':
+			/* HOT UPGRADE: copy of the binary to fall back on. */
+			server_upgrade_fallback = xstrdup(optarg);
+			break;
+		case 'R':
+			/*
+			 * HOT UPGRADE: we ARE the new server, exec'd by the
+			 * previous binary; this file holds its state.
+			 */
+			server_upgrade_file = xstrdup(optarg);
+			break;
 		case '2':
 			tty_add_features(&feat, "256", ":,");
 			break;
@@ -391,7 +490,8 @@ main(int argc, char **argv)
 			cfg_quiet = 0;
 			break;
  		case 'V':
-			printf("tmux %s\n", getversion());
+			/* "tmux X.Y" first: tools parse it; then our name. */
+			printf("tmux %s (tmuxv)\n", getversion());
  			exit(0);
 		case 'l':
 			flags |= CLIENT_LOGIN;
@@ -402,6 +502,17 @@ main(int argc, char **argv)
 			break;
 		case 'N':
 			flags |= CLIENT_NOSTARTSERVER;
+			break;
+		case 'p':
+			/* Select the server by PID (resolve to its socket). */
+			free(path);
+			path = path_from_pid(optarg, &cause);
+			if (path == NULL) {
+				fprintf(stderr, "%s\n",
+				    cause != NULL ? cause : "cannot resolve pid");
+				free(cause);
+				exit(1);
+			}
 			break;
 		case 'q':
 			break;
@@ -424,6 +535,54 @@ main(int argc, char **argv)
 	}
 	argc -= optind;
 	argv += optind;
+
+	/*
+	 * Allow selecting the server by PID as a command option of attach, for
+	 * symmetry with `attach -t <session>`: `attach -p <pid>`. It has to be
+	 * resolved here (client side, before connecting) and stripped, since a
+	 * command cannot switch servers. Scoped to attach so it never clashes
+	 * with the -p that other commands (display-message, capture-pane, ...)
+	 * use for their own purposes.
+	 */
+	if (argc > 0 && (strcmp(argv[0], "attach") == 0 ||
+	    strcmp(argv[0], "attach-session") == 0)) {
+		int	ai;
+
+		for (ai = 1; ai < argc; ai++) {
+			char	*pidstr = NULL;
+
+			/* Skip the value of options that take an argument. */
+			if (strcmp(argv[ai], "-c") == 0 ||
+			    strcmp(argv[ai], "-f") == 0 ||
+			    strcmp(argv[ai], "-t") == 0) {
+				ai++;
+				continue;
+			}
+			if (strcmp(argv[ai], "-p") == 0 && ai + 1 < argc) {
+				pidstr = argv[ai + 1];
+				memmove(&argv[ai], &argv[ai + 2],
+				    (argc - ai - 2) * sizeof *argv);
+				argc -= 2;
+			} else if (strncmp(argv[ai], "-p", 2) == 0 &&
+			    argv[ai][2] != '\0') {
+				pidstr = argv[ai] + 2;
+				memmove(&argv[ai], &argv[ai + 1],
+				    (argc - ai - 1) * sizeof *argv);
+				argc -= 1;
+			}
+			if (pidstr != NULL) {
+				free(path);
+				path = path_from_pid(pidstr, &cause);
+				if (path == NULL) {
+					fprintf(stderr, "%s\n", cause != NULL ?
+					    cause : "cannot resolve pid");
+					free(cause);
+					exit(1);
+				}
+				ai--; /* re-examine the shifted-in slot */
+			}
+		}
+	}
 
 	if (shell_command != NULL && argc != 0)
 		usage();
@@ -514,6 +673,26 @@ main(int argc, char **argv)
 	}
 	socket_path = path;
 	free(label);
+
+	/*
+	 * HOT UPGRADE: with -R we ARE the server the previous binary exec'd
+	 * into - we must NOT go down the client path (that would have us
+	 * connect to our own socket, which nobody is left to accept). Become
+	 * the server in this very process: it already owns the ptys, the
+	 * children and the listening socket.
+	 */
+	if (server_upgrade_file != NULL) {
+		struct tmuxproc		*self;
+		struct event_base	*base;
+
+		if (getenv("TMUXV_UPGRADE_DEBUG") != NULL) {
+			if (chdir("/tmp") != 0)
+				(void)0;	/* le journal atterrit la */
+		}
+		base = osdep_event_init();
+		self = proc_start("upgrade");
+		exit(server_start(self, CLIENT_NOFORK, base, -1, NULL));
+	}
 
 	/* Pass control to the client. */
 	exit(client_main(osdep_event_init(), argc, argv, flags, feat));

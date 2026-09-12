@@ -49,16 +49,17 @@
 	" '#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}' '<' {send -X history-top}" \
 	" '#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}' '>' {send -X history-bottom}" \
 	" ''" \
-	" '#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}' 'C-r' {if -F '#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}' 'copy-mode -t='; send -Xt= search-backward \"#{q:mouse_word}\"}" \
-	" '#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}' 'C-y' {copy-mode -q; send-keys -l -- \"#{q:mouse_word}\"}" \
-	" '#{?mouse_word,Copy #[underscore]#{=/9/...:mouse_word},}' 'c' {copy-mode -q; set-buffer -- \"#{q:mouse_word}\"}" \
-	" '#{?mouse_line,Copy Line,}' 'l' {copy-mode -q; set-buffer -- \"#{q:mouse_line}\"}" \
+	/*
+	 * Plain Copy/Paste rather than the upstream entries built from the
+	 * word under the mouse: Copy takes the current selection when there is
+	 * one, else the word that was clicked. Paste is 'p', not 'v', which
+	 * Vertical Split already uses in this menu.
+	 */ \
+	" 'Copy' 'c' {if -F '#{selection_present}' { send -X copy-selection-no-clear } { copy-mode -q; set-buffer -- \"#{q:mouse_word}\" }}" \
+	" 'Paste' 'p' {paste-buffer -p}" \
 	" ''" \
-	" '#{?mouse_hyperlink,Type #[underscore]#{=/9/...:mouse_hyperlink},}' 'C-h' {copy-mode -q; send-keys -l -- \"#{q:mouse_hyperlink}\"}" \
-	" '#{?mouse_hyperlink,Copy #[underscore]#{=/9/...:mouse_hyperlink},}' 'h' {copy-mode -q; set-buffer -- \"#{q:mouse_hyperlink}\"}" \
-	" ''" \
-	" 'Horizontal Split' 'h' {split-window -h}" \
-	" 'Vertical Split' 'v' {split-window -v}" \
+	" '#{?window_claude_manager,-,}Horizontal Split' 'h' {split-window -h}" \
+	" '#{?window_claude_manager,-,}Vertical Split' 'v' {split-window -v}" \
 	" ''" \
 	" '#{?#{>:#{window_panes},1},,-}Swap Up' 'u' {swap-pane -U}" \
 	" '#{?#{>:#{window_panes},1},,-}Swap Down' 'd' {swap-pane -D}" \
@@ -346,15 +347,63 @@ key_bindings_init(void)
 {
 	static const char *const defaults[] = {
 		/* Prefix keys. */
+		/*
+		 * tmuxv starts in its Turbo Vision look: windowed desktop and
+		 * menu bar. These run BEFORE the configuration file, so
+		 * "set -g @desktop off" in ~/.tmux.conf still wins.
+		 */
+		"set -g @menu-bar on",
+		"set -g @desktop on",
+		/*
+		 * MEMORY: pane processes are the OOM killer's first pick (see
+		 * spawn.c), and a warning shows when the machine has less than
+		 * @memory-warn megabytes available.
+		 */
+		"set -g @oom-score 500",
+		"set -g @memory-warn 512",
+		/*
+		 * CRASH RECOVERY: snapshot the arrangement every minute; a
+		 * clean shutdown erases it, so a file left behind at startup
+		 * means the previous server died and the sessions come back.
+		 */
+		"set -g @restore on",
+		"set -g @restore-interval 60",
+		/*
+		 * Panes nobody is looking at are pushed to swap under the
+		 * @memory-warn threshold - only where the cgroup is delegated
+		 * (systemd-run --user --scope -p Delegate=yes), otherwise this
+		 * does nothing at all.
+		 */
+		"set -g @swap-idle on",
+		/*
+		 * The agent bus, inside the server. @bus-db empty = messages
+		 * kept in memory only (this server's conversations still talk
+		 * to each other); set it to share them with other tmuxv and
+		 * keep them, e.g. mysql:///claude_agent?socket=/run/mysqld/
+		 * mysqld.sock (no user: the login name, unix_socket auth).
+		 */
+		"set -g @bus on",
+		"set -g @bus-port 4319",
+		"set -g @bus-bind 0.0.0.0",
+		"set -g @bus-db ''",
+		"set -g @bus-token ''",
+
 		"bind -N 'Send the prefix key' C-b { send-prefix }",
 		"bind -N 'Rotate through the panes' C-o { rotate-window }",
 		"bind -N 'Suspend the current client' C-z { suspend-client }",
 		"bind -N 'Select next layout' Space { next-layout }",
-		"bind -N 'Break pane to a new window' ! { break-pane }",
-		"bind -N 'Split window vertically' '\"' { split-window }",
-		"bind -N 'List all paste buffers' '#' { list-buffers }",
+		/*
+		 * CLAUDE: a conversation only exists as a pane OF the manager -
+		 * breaking it out drops it from the list and from message
+		 * delivery, and splitting creates a pane that looks like a
+		 * conversation but has no agent name and no bus registration.
+		 * Both are refused there; [+ Nouvelle] is the way in.
+		 */
+		"bind -N 'Break pane to a new window' ! { if -F '#{window_claude_manager}' { display-message 'Gestionnaire Claude : une conversation ne se detache pas' } { break-pane } }",
+		"bind -N 'Split window vertically' '\"' { if -F '#{window_claude_manager}' { display-message 'Gestionnaire Claude : utilisez [+ Nouvelle]' } { split-window } }",
+		"bind -N 'List all paste buffers' '#' { if -F '#{==:#{@desktop},on}' { display-buffers } { list-buffers } }",
 		"bind -N 'Rename current session' '$' { command-prompt -I'#S' { rename-session -- '%%' } }",
-		"bind -N 'Split window horizontally' % { split-window -h }",
+		"bind -N 'Split window horizontally' % { if -F '#{window_claude_manager}' { display-message 'Gestionnaire Claude : utilisez [+ Nouvelle]' } { split-window -h } }",
 		"bind -N 'Kill current window' & { confirm-before -p\"kill-window #W? (y/n)\" kill-window }",
 		"bind -N 'Prompt for window index to select' \"'\" { command-prompt -T window-target -pindex { select-window -t ':%%' } }",
 		"bind -N 'Switch to previous client' ( { switch-client -p }",
@@ -375,8 +424,8 @@ key_bindings_init(void)
 		"bind -N 'Select window 9' 9 { select-window -t:=9 }",
 		"bind -N 'Prompt for a command' : { command-prompt }",
 		"bind -N 'Move to the previously active pane' \\; { last-pane }",
-		"bind -N 'Choose a paste buffer from a list' = { choose-buffer -Z }",
-		"bind -N 'List key bindings' ? { list-keys -N }",
+		"bind -N 'Choose a paste buffer from a list' = { if -F '#{==:#{@desktop},on}' { display-buffers } { choose-buffer -Z } }",
+		"bind -N 'List key bindings' ? { if -F '#{==:#{@desktop},on}' { display-keys } { list-keys -N } }",
 		"bind -N 'Choose and detach a client from a list' D { choose-client -Z }",
 		"bind -N 'Spread panes out evenly' E { select-layout -E }",
 		"bind -N 'Switch to the last client' L { switch-client -l }",
@@ -395,14 +444,24 @@ key_bindings_init(void)
 		"bind -N 'Select the previous window' p { previous-window }",
 		"bind -N 'Display pane numbers' q { display-panes }",
 		"bind -N 'Redraw the current client' r { refresh-client }",
-		"bind -N 'Choose a session from a list' s { choose-tree -Zs }",
+		"bind -N 'Choose a session from a list' s { if -F '#{==:#{@desktop},on}' { display-sessions } { choose-tree -Zs } }",
 		"bind -N 'Show a clock' t { clock-mode }",
-		"bind -N 'Choose a window from a list' w { choose-tree -Zw }",
+		"bind -N 'Choose a window from a list' w { if -F '#{==:#{@desktop},on}' { display-windows } { choose-tree -Zw } }",
 		"bind -N 'Kill the active pane' x { confirm-before -p\"kill-pane #P? (y/n)\" kill-pane }",
 		"bind -N 'Zoom the active pane' z { resize-pane -Z }",
+		/* Turbo Vision UI toggles (menu bar / windowed desktop). */
+		/*
+		 * CLAUDE: the manager is a desktop object - its conversation
+		 * list only exists inside a desktop frame. Toggling the
+		 * desktop off from there hides every conversation but the
+		 * active one with no way back, so neither toggle acts while
+		 * the manager is the current window.
+		 */
+		"bind -N 'Toggle the menu bar (Turbo Vision)' B { if -F '#{window_claude_manager}' { display-message 'Gestionnaire Claude : bascule desactivee ici' } { if -F '#{==:#{@menu-bar},on}' { set -g @menu-bar off } { set -g @menu-bar on } } }",
+		"bind -N 'Toggle the windowed desktop (Turbo Vision)' F { if -F '#{window_claude_manager}' { display-message 'Gestionnaire Claude : bascule desactivee ici' } { if -F '#{==:#{@desktop},on}' { set -g @desktop off } { set -g @desktop on } } }",
 		"bind -N 'Swap the active pane with the pane above' '{' { swap-pane -U }",
 		"bind -N 'Swap the active pane with the pane below' '}' { swap-pane -D }",
-		"bind -N 'Show messages' '~' { show-messages }",
+		"bind -N 'Show messages' '~' { if -F '#{==:#{@desktop},on}' { display-log } { show-messages } }",
 		"bind -N 'Enter copy mode and scroll up' PPage { copy-mode -u }",
 		"bind -N 'Select the pane above the active pane' -r Up { select-pane -U }",
 		"bind -N 'Select the pane below the active pane' -r Down { select-pane -D }",
@@ -437,8 +496,14 @@ key_bindings_init(void)
 		/* Mouse button 1 down on pane. */
 		"bind -n MouseDown1Pane { select-pane -t=; send -M }",
 
-		/* Mouse button 1 drag on pane. */
-		"bind -n MouseDrag1Pane { if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -M } }",
+		/*
+		 * Mouse button 1 drag on pane: ALWAYS select text, even over a
+		 * program that reads the mouse itself (an agent), and hide the
+		 * [x/y] position marker (-H) so selecting stays discreet. The
+		 * selection is kept after the release (see the copy-mode
+		 * table) instead of vanishing.
+		 */
+		"bind -n MouseDrag1Pane { if -F '#{pane_in_mode}' { send -M } { copy-mode -HM } }",
 
 		/* Mouse wheel up on pane. */
 		"bind -n WheelUpPane { if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -e } }",
@@ -447,10 +512,10 @@ key_bindings_init(void)
 		"bind -n MouseDown2Pane { select-pane -t=; if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { paste -p } }",
 
 		/* Mouse button 1 double click on pane. */
-		"bind -n DoubleClick1Pane { select-pane -t=; if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -H; send -X select-word; run -d0.3; send -X copy-pipe-and-cancel } }",
+		"bind -n DoubleClick1Pane { select-pane -t=; if -F '#{pane_in_mode}' { send -M } { copy-mode -H; send -X select-word; run -d0.3; send -X copy-selection-no-clear } }",
 
 		/* Mouse button 1 triple click on pane. */
-		"bind -n TripleClick1Pane { select-pane -t=; if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -H; send -X select-line; run -d0.3; send -X copy-pipe-and-cancel } }",
+		"bind -n TripleClick1Pane { select-pane -t=; if -F '#{pane_in_mode}' { send -M } { copy-mode -H; send -X select-line; run -d0.3; send -X copy-selection-no-clear } }",
 
 		/* Mouse button 1 drag on border. */
 		"bind -n MouseDrag1Border { resize-pane -M }",
@@ -509,13 +574,18 @@ key_bindings_init(void)
 		"bind -Tcopy-mode t { command-prompt -1p'(jump to forward)' { send -X jump-to-forward '%%' } }",
 		"bind -Tcopy-mode Home { send -X start-of-line }",
 		"bind -Tcopy-mode End { send -X end-of-line }",
-		"bind -Tcopy-mode MouseDown1Pane select-pane",
+		"bind -Tcopy-mode MouseDown1Pane { select-pane; send -X cancel }",
 		"bind -Tcopy-mode MouseDrag1Pane { select-pane; send -X begin-selection }",
-		"bind -Tcopy-mode MouseDragEnd1Pane { send -X copy-pipe-and-cancel }",
+		"bind -Tcopy-mode MouseDragEnd1Pane { send -X copy-selection-no-clear }",
+		/*
+		 * Middle click (X11 style): the selection is already in the
+		 * buffer since the drag ended - leave copy mode and paste it.
+		 */
+		"bind -Tcopy-mode MouseDown2Pane { select-pane; send -X cancel; paste -p }",
 		"bind -Tcopy-mode WheelUpPane { select-pane; send -N5 -X scroll-up }",
 		"bind -Tcopy-mode WheelDownPane { select-pane; send -N5 -X scroll-down }",
-		"bind -Tcopy-mode DoubleClick1Pane { select-pane; send -X select-word; run -d0.3; send -X copy-pipe-and-cancel }",
-		"bind -Tcopy-mode TripleClick1Pane { select-pane; send -X select-line; run -d0.3; send -X copy-pipe-and-cancel }",
+		"bind -Tcopy-mode DoubleClick1Pane { select-pane; send -X select-word; run -d0.3; send -X copy-selection-no-clear }",
+		"bind -Tcopy-mode TripleClick1Pane { select-pane; send -X select-line; run -d0.3; send -X copy-selection-no-clear }",
 		"bind -Tcopy-mode NPage { send -X page-down }",
 		"bind -Tcopy-mode PPage { send -X page-up }",
 		"bind -Tcopy-mode Up { send -X cursor-up }",
@@ -621,13 +691,14 @@ key_bindings_init(void)
 		"bind -Tcopy-mode-vi % { send -X next-matching-bracket }",
 		"bind -Tcopy-mode-vi Home { send -X start-of-line }",
 		"bind -Tcopy-mode-vi End { send -X end-of-line }",
-		"bind -Tcopy-mode-vi MouseDown1Pane { select-pane }",
+		"bind -Tcopy-mode-vi MouseDown1Pane { select-pane; send -X cancel }",
 		"bind -Tcopy-mode-vi MouseDrag1Pane { select-pane; send -X begin-selection }",
-		"bind -Tcopy-mode-vi MouseDragEnd1Pane { send -X copy-pipe-and-cancel }",
+		"bind -Tcopy-mode-vi MouseDragEnd1Pane { send -X copy-selection-no-clear }",
+		"bind -Tcopy-mode-vi MouseDown2Pane { select-pane; send -X cancel; paste -p }",
 		"bind -Tcopy-mode-vi WheelUpPane { select-pane; send -N5 -X scroll-up }",
 		"bind -Tcopy-mode-vi WheelDownPane { select-pane; send -N5 -X scroll-down }",
-		"bind -Tcopy-mode-vi DoubleClick1Pane { select-pane; send -X select-word; run -d0.3; send -X copy-pipe-and-cancel }",
-		"bind -Tcopy-mode-vi TripleClick1Pane { select-pane; send -X select-line; run -d0.3; send -X copy-pipe-and-cancel }",
+		"bind -Tcopy-mode-vi DoubleClick1Pane { select-pane; send -X select-word; run -d0.3; send -X copy-selection-no-clear }",
+		"bind -Tcopy-mode-vi TripleClick1Pane { select-pane; send -X select-line; run -d0.3; send -X copy-selection-no-clear }",
 		"bind -Tcopy-mode-vi BSpace { send -X cursor-left }",
 		"bind -Tcopy-mode-vi NPage { send -X page-down }",
 		"bind -Tcopy-mode-vi PPage { send -X page-up }",

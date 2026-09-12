@@ -664,7 +664,7 @@ tty_keys_next(struct tty *tty)
 	const char		*buf;
 	size_t			 len, size;
 	cc_t			 bspace;
-	int			 delay, expired = 0, n;
+	int			 delay, expired = 0, n, rechecked = 0;
 	key_code		 key;
 	struct mouse_event	 m = { 0 };
 	struct key_event	*event;
@@ -676,6 +676,7 @@ tty_keys_next(struct tty *tty)
 		return (0);
 	log_debug("%s: keys are %zu (%.*s)", c->name, len, (int)len, buf);
 
+start:
 	/* Is this a clipboard response? */
 	switch (tty_keys_clipboard(tty, buf, len, &size)) {
 	case 0:		/* yes */
@@ -812,6 +813,17 @@ partial_key:
 		if (evtimer_initialized(&tty->key_timer) &&
 		    !evtimer_pending(&tty->key_timer, NULL)) {
 			expired = 1;
+			/*
+			 * A terminal REPLY (OSC/DCS) is never something the
+			 * user typed. Before giving up and flushing the bytes
+			 * into the pane as keystrokes, re-run the response
+			 * parsers once: the rest of the reply may have arrived
+			 * just before the timer fired.
+			 */
+			if (!rechecked) {
+				rechecked = 1;
+				goto start;
+			}
 			goto first_key;
 		}
 		return (0);
@@ -821,6 +833,15 @@ partial_key:
 	delay = options_get_number(global_options, "escape-time");
 	if (delay == 0)
 		delay = 1;
+	/*
+	 * OSC (\033]) and DCS (\033P) are terminal replies, not typed keys, and
+	 * they routinely arrive split across reads. Give them room to complete
+	 * even when escape-time is tiny (a 10ms escape-time otherwise dumps
+	 * "]11;rgb:..." into the pane), without delaying the Escape key itself.
+	 */
+	if (len > 1 && buf[0] == '\033' && (buf[1] == ']' || buf[1] == 'P') &&
+	    delay < 500)
+		delay = 500;
 	tv.tv_sec = delay / 1000;
 	tv.tv_usec = (delay % 1000) * 1000L;
 

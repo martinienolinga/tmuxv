@@ -67,6 +67,7 @@ struct window_pane_input_data {
 	struct client_file	*file;
 };
 
+static int	window_unzoom1(struct window *, int);
 static struct window_pane *window_pane_create(struct window *, u_int, u_int,
 		    u_int);
 static void	window_pane_destroy(struct window_pane *);
@@ -302,6 +303,12 @@ window_create(u_int sx, u_int sy, u_int xpixel, u_int ypixel)
 	w = xcalloc(1, sizeof *w);
 	w->name = xstrdup("");
 	w->flags = 0;
+	/*
+	 * CLAUDE: no saved conversation is selected yet - 0 is a valid index,
+	 * so the first one would show up highlighted before any click.
+	 */
+	w->claude_sel_sess = -1;
+	w->claude_anchor_sess = -1;
 
 	TAILQ_INIT(&w->panes);
 	TAILQ_INIT(&w->last_panes);
@@ -338,7 +345,7 @@ window_destroy(struct window *w)
 {
 	log_debug("window @%u destroyed (%d references)", w->id, w->references);
 
-	window_unzoom(w);
+	window_unzoom1(w, 0);	/* no notify: it would resurrect and re-free w */
 	RB_REMOVE(windows, &windows, w);
 
 	if (w->layout_root != NULL)
@@ -667,13 +674,23 @@ window_zoom(struct window_pane *wp)
 	w->saved_layout_root = w->layout_root;
 	layout_init(w, wp);
 	w->flags |= WINDOW_ZOOMED;
+	if (claude_manager(w))
+		claude_hidden_fit(w);	/* hidden conversations: full size */
 	notify_window("window-layout-changed", w);
 
 	return (0);
 }
 
-int
-window_unzoom(struct window *w)
+/*
+ * `notify` must be 0 when unzooming a window that is being destroyed: a
+ * notification takes a reference on the window (notify_add -> window_add_ref)
+ * and window_destroy() frees it anyway, so the queued notify callback later
+ * drops that reference and frees the window a SECOND time. Found with
+ * AddressSanitizer: "kill-server" with any zoomed window (plain tmux, no
+ * fork feature involved) double-frees in window_remove_ref/notify_callback.
+ */
+static int
+window_unzoom1(struct window *w, int notify)
 {
 	struct window_pane	*wp;
 
@@ -690,9 +707,16 @@ window_unzoom(struct window *w)
 		wp->saved_layout_cell = NULL;
 	}
 	layout_fix_panes(w, NULL);
-	notify_window("window-layout-changed", w);
+	if (notify)
+		notify_window("window-layout-changed", w);
 
 	return (0);
+}
+
+int
+window_unzoom(struct window *w)
+{
+	return (window_unzoom1(w, 1));
 }
 
 int
@@ -965,6 +989,7 @@ window_pane_destroy(struct window_pane *wp)
 
 	window_pane_reset_mode_all(wp);
 	free(wp->searchstr);
+	swap_pane_free(wp->pid);	/* its cgroup goes with it */
 
 	if (wp->fd != -1) {
 #ifdef HAVE_UTEMPTER
@@ -1091,6 +1116,9 @@ window_pane_set_mode(struct window_pane *wp, struct window_pane *swp,
 {
 	struct window_mode_entry	*wme;
 
+	/* The caller re-arms this if the mode is a mouse selection. */
+	wp->drag_selection = 0;
+
 	if (!TAILQ_EMPTY(&wp->modes) && TAILQ_FIRST(&wp->modes)->mode == mode)
 		return (1);
 
@@ -1125,6 +1153,8 @@ void
 window_pane_reset_mode(struct window_pane *wp)
 {
 	struct window_mode_entry	*wme, *next;
+
+	wp->drag_selection = 0;
 
 	if (TAILQ_EMPTY(&wp->modes))
 		return;

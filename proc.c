@@ -160,6 +160,13 @@ proc_update_event(struct tmuxpeer *peer)
 	event_add(&peer->event, NULL);
 }
 
+/* HOT UPGRADE: the socket behind a peer, so it can survive an execve(). */
+int
+proc_peer_fd(struct tmuxpeer *peer)
+{
+	return (peer->ibuf.fd);
+}
+
 int
 proc_send(struct tmuxpeer *peer, enum msgtype type, int fd, const void *buf,
     size_t len)

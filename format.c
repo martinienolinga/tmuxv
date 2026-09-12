@@ -1225,6 +1225,14 @@ format_cb_mouse_status_range(struct format_tree *ft)
 	if (ft->c == NULL || (~ft->c->tty.flags & TTY_STARTED))
 		return (NULL);
 
+	/* MENU BAR: top line uses the menu bar's own clickable ranges. */
+	if (menu_bar_size(ft->c) != 0 && ft->m.y < menu_bar_size(ft->c)) {
+		sr = menu_bar_get_range(ft->c, ft->m.x);
+		if (sr == NULL || sr->type != STYLE_RANGE_USER)
+			return (NULL);
+		return (xstrdup(sr->string));
+	}
+
 	if (ft->m.statusat == 0 && ft->m.y < ft->m.statuslines) {
 		x = ft->m.x;
 		y = ft->m.y;
@@ -1302,6 +1310,27 @@ format_cb_buffer_sample(struct format_tree *ft)
 	if (ft->pb != NULL)
 		return (paste_make_sample(ft->pb));
 	return (NULL);
+}
+
+/* Callback for bus_mode: "db", "local" (memory) or "off". */
+static void *
+format_cb_bus_mode(__unused struct format_tree *ft)
+{
+	return (xstrdup(bus_mode()));
+}
+
+/* Callback for bus_mode_reason: why the bus answers from where it does. */
+static void *
+format_cb_bus_mode_reason(__unused struct format_tree *ft)
+{
+	return (xstrdup(bus_mode_reason()));
+}
+
+/* Callback for bus_port: the port the agent bus listens on (0: none). */
+static void *
+format_cb_bus_port(__unused struct format_tree *ft)
+{
+	return (format_printf("%d", bus_port()));
 }
 
 /* Callback for buffer_size. */
@@ -2088,6 +2117,36 @@ format_cb_pane_synchronized(struct format_tree *ft)
 	return (NULL);
 }
 
+/* Callback for pane_agent: this conversation's address on the agent bus. */
+static void *
+format_cb_pane_agent(struct format_tree *ft)
+{
+	const char	*name;
+
+	if (ft->wp != NULL && (name = claude_agent_name(ft->wp)) != NULL)
+		return (xstrdup(name));
+	return (NULL);
+}
+
+/* Callback for pane_claude_selected: in the manager list's selection. */
+static void *
+format_cb_pane_claude_selected(struct format_tree *ft)
+{
+	if (ft->wp != NULL && ft->wp->claude_marked)
+		return (xstrdup("1"));
+	return (xstrdup("0"));
+}
+
+/* Callback for tmuxv_version: the package version this server runs. */
+static void *
+format_cb_tmuxv_version(__unused struct format_tree *ft)
+{
+	extern const char	 tmuxv_version_tag[];
+	const char		*v = tmuxv_version_tag + 10;	/* "@(#)tmuxv " */
+
+	return (xstrndup(v, strlen(v) - 2));			/* " @" */
+}
+
 /* Callback for pane_title. */
 static void *
 format_cb_pane_title(struct format_tree *ft)
@@ -2585,6 +2644,102 @@ format_cb_window_width(struct format_tree *ft)
 	return (NULL);
 }
 
+/*
+ * Callbacks for window_desktop_x/y/w/h/zoomed (Turbo Vision desktop rect).
+ * With a client, report the EFFECTIVE (clamped to that client's area) rect,
+ * i.e. where the window is really drawn; otherwise the stored one.
+ */
+static void
+format_desktop_rect(struct format_tree *ft, u_int *x, u_int *y, u_int *w,
+    u_int *h)
+{
+	if (ft->c != NULL && desktop_get_rect_w(ft->c, ft->w, x, y, w, h))
+		return;
+	*x = ft->w->desktop_x;
+	*y = ft->w->desktop_y;
+	*w = ft->w->desktop_w;
+	*h = ft->w->desktop_h;
+}
+
+static void *
+format_cb_window_desktop_x(struct format_tree *ft)
+{
+	u_int	x, y, w, h;
+
+	if (ft->w == NULL)
+		return (NULL);
+	format_desktop_rect(ft, &x, &y, &w, &h);
+	return (format_printf("%u", x));
+}
+
+static void *
+format_cb_window_desktop_y(struct format_tree *ft)
+{
+	u_int	x, y, w, h;
+
+	if (ft->w == NULL)
+		return (NULL);
+	format_desktop_rect(ft, &x, &y, &w, &h);
+	return (format_printf("%u", y));
+}
+
+static void *
+format_cb_window_desktop_w(struct format_tree *ft)
+{
+	u_int	x, y, w, h;
+
+	if (ft->w == NULL)
+		return (NULL);
+	format_desktop_rect(ft, &x, &y, &w, &h);
+	return (format_printf("%u", w));
+}
+
+static void *
+format_cb_window_desktop_h(struct format_tree *ft)
+{
+	u_int	x, y, w, h;
+
+	if (ft->w == NULL)
+		return (NULL);
+	format_desktop_rect(ft, &x, &y, &w, &h);
+	return (format_printf("%u", h));
+}
+
+static void *
+format_cb_window_desktop_zoomed(struct format_tree *ft)
+{
+	if (ft->w != NULL)
+		return (format_printf("%d", ft->w->desktop_zoomed ? 1 : 0));
+	return (NULL);
+}
+
+/* MEMORY: what this conversation's program and its children use, in MB. */
+static void *
+format_cb_pane_memory(struct format_tree *ft)
+{
+	if (ft->wp != NULL)
+		return (format_printf("%u", ft->wp->claude_mem / 1024));
+	return (NULL);
+}
+
+/* MEMORY: is the machine short of memory (per the @memory-warn threshold)? */
+static void *
+format_cb_window_claude_lowmem(struct format_tree *ft)
+{
+	if (ft->w != NULL)
+		return (format_printf("%d", ft->w->claude_lowmem ? 1 : 0));
+	return (NULL);
+}
+
+/* CLAUDE: is this window the Claude Code conversation manager? */
+static void *
+format_cb_window_claude_manager(struct format_tree *ft)
+{
+	if (ft->w != NULL)
+		return (format_printf("%d", ft->w->claude_mgr ? 1 : 0));
+	return (NULL);
+}
+
 /* Callback for window_zoomed_flag. */
 static void *
 format_cb_window_zoomed_flag(struct format_tree *ft)
@@ -2769,6 +2924,15 @@ static const struct format_table_entry format_table[] = {
 	{ "buffer_size", FORMAT_TABLE_STRING,
 	  format_cb_buffer_size
 	},
+	{ "bus_mode", FORMAT_TABLE_STRING,
+	  format_cb_bus_mode
+	},
+	{ "bus_mode_reason", FORMAT_TABLE_STRING,
+	  format_cb_bus_mode_reason
+	},
+	{ "bus_port", FORMAT_TABLE_STRING,
+	  format_cb_bus_port
+	},
 	{ "client_activity", FORMAT_TABLE_TIME,
 	  format_cb_client_activity
 	},
@@ -2940,6 +3104,9 @@ static const struct format_table_entry format_table[] = {
 	{ "pane_active", FORMAT_TABLE_STRING,
 	  format_cb_pane_active
 	},
+	{ "pane_agent", FORMAT_TABLE_STRING,	/* CLAUDE: bus address */
+	  format_cb_pane_agent
+	},
 	{ "pane_at_bottom", FORMAT_TABLE_STRING,
 	  format_cb_pane_at_bottom
 	},
@@ -2957,6 +3124,9 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "pane_bottom", FORMAT_TABLE_STRING,
 	  format_cb_pane_bottom
+	},
+	{ "pane_claude_selected", FORMAT_TABLE_STRING,	/* CLAUDE */
+	  format_cb_pane_claude_selected
 	},
 	{ "pane_current_command", FORMAT_TABLE_STRING,
 	  format_cb_current_command
@@ -3008,6 +3178,9 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "pane_marked_set", FORMAT_TABLE_STRING,
 	  format_cb_pane_marked_set
+	},
+	{ "pane_memory", FORMAT_TABLE_STRING,	/* MEMORY: MB */
+	  format_cb_pane_memory
 	},
 	{ "pane_mode", FORMAT_TABLE_STRING,
 	  format_cb_pane_mode
@@ -3138,6 +3311,9 @@ static const struct format_table_entry format_table[] = {
 	{ "tree_mode_format", FORMAT_TABLE_STRING,
 	  format_cb_tree_mode_format
 	},
+	{ "tmuxv_version", FORMAT_TABLE_STRING,	/* the package's */
+	  format_cb_tmuxv_version
+	},
 	{ "uid", FORMAT_TABLE_STRING,
 	  format_cb_uid
 	},
@@ -3179,6 +3355,27 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "window_cell_width", FORMAT_TABLE_STRING,
 	  format_cb_window_cell_width
+	},
+	{ "window_claude_lowmem", FORMAT_TABLE_STRING,
+	  format_cb_window_claude_lowmem
+	},
+	{ "window_claude_manager", FORMAT_TABLE_STRING,
+	  format_cb_window_claude_manager
+	},
+	{ "window_desktop_h", FORMAT_TABLE_STRING,
+	  format_cb_window_desktop_h
+	},
+	{ "window_desktop_w", FORMAT_TABLE_STRING,
+	  format_cb_window_desktop_w
+	},
+	{ "window_desktop_x", FORMAT_TABLE_STRING,
+	  format_cb_window_desktop_x
+	},
+	{ "window_desktop_y", FORMAT_TABLE_STRING,
+	  format_cb_window_desktop_y
+	},
+	{ "window_desktop_zoomed", FORMAT_TABLE_STRING,
+	  format_cb_window_desktop_zoomed
 	},
 	{ "window_end_flag", FORMAT_TABLE_STRING,
 	  format_cb_window_end_flag

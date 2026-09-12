@@ -104,9 +104,20 @@ cmd_confirm_before_exec(struct cmd *self, struct cmdq_item *item)
 		cmd, cdata->confirm_key);
 	}
 
-	status_prompt_set(tc, target, new_prompt, NULL,
-	    cmd_confirm_before_callback, cmd_confirm_before_free, cdata,
-	    PROMPT_SINGLE, PROMPT_TYPE_COMMAND);
+	/*
+	 * Turbo Vision desktop: ask in a [Oui] [Non] message box instead of
+	 * the status-line prompt (same callback contract).
+	 */
+	if (desktop_enabled(tc)) {
+		char	key[2] = { cdata->confirm_key, '\0' };
+
+		confirm_dialog(tc, new_prompt, key, cmd_confirm_before_callback,
+		    cmd_confirm_before_free, cdata);
+	} else {
+		status_prompt_set(tc, target, new_prompt, NULL,
+		    cmd_confirm_before_callback, cmd_confirm_before_free, cdata,
+		    PROMPT_SINGLE, PROMPT_TYPE_COMMAND);
+	}
 	free(new_prompt);
 
 	if (!wait)

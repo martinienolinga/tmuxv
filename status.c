@@ -19,6 +19,7 @@
 #include <sys/types.h>
 #include <sys/time.h>
 
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -263,6 +264,1028 @@ status_line_size(struct client *c)
 	return (s->statuslines);
 }
 
+/*
+ * MENU BAR: return the @menu-bar-format option string, or NULL if the menu bar
+ * is disabled (option unset or empty).
+ */
+const char *
+menu_bar_format(struct client *c)
+{
+	struct session		*s = c->session;
+	struct options_entry	*o;
+	const char		*value;
+
+	if (c->flags & (CLIENT_STATUSOFF|CLIENT_CONTROL))
+		return (NULL);
+	if (s == NULL)
+		return (NULL);
+	o = options_get(s->options, "@menu-bar-format");
+	if (o == NULL)
+		return (NULL);
+	value = options_get_string(s->options, "@menu-bar-format");
+	if (value == NULL || *value == '\0')
+		return (NULL);
+	return (value);
+}
+
+/*
+ * MENU BAR: the menu definition, compiled into the binary (façon Turbo Vision).
+ * Each entry: label, shortcut key shown/pressable, tmux command run on choice.
+ * A NULL name is a separator line.
+ */
+struct menu_bar_entry {
+	const char	*name;
+	key_code	 key;
+	const char	*command;
+};
+struct menu_bar_def {
+	const char			*title;
+	char				 mnemonic; /* Alt+this opens it */
+	const struct menu_bar_entry	*items;
+	u_int				 count;
+};
+
+/*
+ * MENU BAR: Turbo Vision colour theme (light-grey bar, black text, red
+ * mnemonics, green selection, black-on-grey box).
+ */
+#define MENU_BAR_STYLE		"fill=#c0c0c0,bg=#c0c0c0,fg=#000000"
+#define MENU_BAR_MNEMONIC	"#[fg=#cc0000]"
+/* Palette moved to tmux.h: menus opened elsewhere (menu.c) share it. */
+
+static const struct menu_bar_entry menu_bar_fichier[] = {
+	{ "Nouvelle fenêtre",	'n', "new-window" },
+	{ "Nouvelle fenêtre après", 'a', "new-window -a" },
+	{ "Renommer la fenêtre", 'r',
+	    "command-prompt -I \"#W\" { rename-window \"%%\" }" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Fermer la fenêtre",	'x',
+	    "confirm-before -p \"Fermer la fenêtre ?\" kill-window" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Restaurer une session...", 's', "restore-session -m" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Détacher",		'd', "detach-client" },
+	{ "Tuer le serveur tmuxv", 'q',
+	    "confirm-before -p \"Tuer le serveur tmuxv ?\" kill-server" },
+};
+static const struct menu_bar_entry menu_bar_edition[] = {
+	{ "Mode copie",		'c', "copy-mode" },
+	{ "Coller",		'v', "paste-buffer -p" },
+	{ "Choisir un tampon",	'b', "display-buffers" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Défiler vers le haut", 'u', "copy-mode -u" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Effacer l'historique", 'e', "clear-history" },
+};
+static const struct menu_bar_entry menu_bar_affichage[] = {
+	{ "Découper horizontalement", 'h', "split-window -h" },
+	{ "Découper verticalement",   'v', "split-window -v" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Disposition égale H", '1', "select-layout even-horizontal" },
+	{ "Disposition égale V", '2', "select-layout even-vertical" },
+	{ "Principale H",	'3', "select-layout main-horizontal" },
+	{ "Principale V",	'4', "select-layout main-vertical" },
+	{ "Mosaïque",		'5', "select-layout tiled" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Zoom panneau",	'z', "resize-pane -Z" },
+	{ NULL, KEYC_NONE, NULL },
+	/* Same toggles as prefix+B / prefix+F (key-bindings.c). */
+	{ "Barre de menus (préfixe B)", 'b',
+	  "if -F '#{==:#{@menu-bar},on}' { set -g @menu-bar off } { set -g @menu-bar on }" },
+	{ "Mode fenêtré (préfixe F)", 'f',
+	  "if -F '#{==:#{@desktop},on}' { set -g @desktop off } { set -g @desktop on }" },
+};
+static const struct menu_bar_entry menu_bar_panneau[] = {
+	{ "Panneau suivant",	'o', "select-pane -t :.+" },
+	{ "Panneau précédent",	'p', "select-pane -t :.-" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Aller à gauche",	'h', "select-pane -L" },
+	{ "Aller en bas",	'j', "select-pane -D" },
+	{ "Aller en haut",	'k', "select-pane -U" },
+	{ "Aller à droite",	'l', "select-pane -R" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Faire pivoter",	'r', "rotate-window" },
+	{ "Marquer",		'm', "select-pane -m" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Fermer le panneau",	'x',
+	    "confirm-before -p \"Fermer le panneau ?\" kill-pane" },
+};
+static const struct menu_bar_entry menu_bar_fenetre[] = {
+	{ "Suivante",		'n', "next-window" },
+	{ "Précédente",		'p', "previous-window" },
+	{ "Dernière",		'l', "last-window" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Déplacer à gauche",	'g', "swap-window -t -1" },
+	{ "Déplacer à droite",	'd', "swap-window -t +1" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Lister les fenêtres", 'w', "display-windows" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Gestionnaire Claude Code", 'c', "claude-manager" },
+};
+static const struct menu_bar_entry menu_bar_session[] = {
+	{ "Nouvelle session",	'n', "new-session" },
+	{ "Renommer la session", 'r',
+	    "command-prompt -I \"#S\" { rename-session \"%%\" }" },
+	{ "Lister les sessions", 's', "display-sessions" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Session suivante",	'.', "switch-client -n" },
+	{ "Session précédente",	',', "switch-client -p" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Détacher",		'd', "detach-client" },
+	{ "Tuer la session",	'k',
+	    "confirm-before -p \"Tuer la session ?\" kill-session" },
+};
+static const struct menu_bar_entry menu_bar_parametres[] = {
+	{ "Configurer…",	'c', "display-form" },
+	{ NULL, KEYC_NONE, NULL },
+	{ "Recharger ~/.tmux.conf", 'r', "source-file ~/.tmux.conf" },
+};
+static const struct menu_bar_entry menu_bar_aide[] = {
+	{ "À propos", 'a', "display-about" },
+	{ "Raccourcis clavier",	'k', "display-keys" },
+	{ "Liste des commandes", 'c', "display-commands" },
+};
+
+#define MENU_BAR_ENTRY(x) (x), nitems(x)
+static const struct menu_bar_def menu_bar_menus[] = {
+	{ "Fichier",   'f', MENU_BAR_ENTRY(menu_bar_fichier) },
+	{ "Édition",   'd', MENU_BAR_ENTRY(menu_bar_edition) },
+	{ "Affichage", 'a', MENU_BAR_ENTRY(menu_bar_affichage) },
+	{ "Panneau",   'p', MENU_BAR_ENTRY(menu_bar_panneau) },
+	{ "Fenêtre",   'n', MENU_BAR_ENTRY(menu_bar_fenetre) },
+	{ "Session",   's', MENU_BAR_ENTRY(menu_bar_session) },
+	{ "Paramètres", 'm', MENU_BAR_ENTRY(menu_bar_parametres) },
+	{ "Aide",      'i', MENU_BAR_ENTRY(menu_bar_aide) },
+};
+#define MENU_BAR_COUNT nitems(menu_bar_menus)
+
+/*
+ * DESKTOP: geometry of pane wp's own vertical scrollbar inside a window
+ * frame (rx, ry, rw, rh) - every pane has one, like every TVision view: the
+ * frame's right column when the pane touches the right edge, otherwise the
+ * pane's own LAST column, so the separator column to its right stays a plain
+ * draggable resize band (scrollbar, then the band on its right).
+ * Returns 0 if the pane is hidden or too short for ▲ + track + ▼.
+ */
+int
+desktop_pane_scrollbar(struct client *c, struct window_pane *wp, u_int rx,
+    u_int ry, u_int rw, u_int rh, u_int *bx, u_int *by, u_int *bsize)
+{
+	u_int	iw = (rw > 2) ? rw - 2 : 0, ih = (rh > 2) ? rh - 2 : 0, size;
+	u_int	inset;
+
+	if (!window_pane_visible(wp) || wp->yoff >= ih || wp->xoff >= iw)
+		return (0);
+	size = wp->sy;
+	if (wp->yoff + size > ih)
+		size = ih - wp->yoff;
+	if (size < 3)
+		return (0);
+	/* A manager window's panes are shifted right by the list column. */
+	inset = claude_inset(c, wp->window);
+	if (inset >= iw)
+		return (0);
+	if (inset + wp->xoff + wp->sx >= iw)
+		*bx = rx + rw - 1;			/* frame column */
+	else if (wp->sx >= 2)
+		*bx = rx + 1 + inset + wp->xoff + wp->sx - 1;	/* last column */
+	else
+		return (0);				/* too narrow to spare one */
+	*by = ry + 1 + wp->yoff;
+	*bsize = size;
+	return (1);
+}
+
+/* MENU BAR: size of the menu bar (0 or 1 line), gated by the @menu-bar option. */
+u_int
+menu_bar_size(struct client *c)
+{
+	struct session		*s = c->session;
+	struct options_entry	*o;
+	const char		*v;
+
+	if (c->flags & (CLIENT_STATUSOFF|CLIENT_CONTROL))
+		return (0);
+	if (s == NULL)
+		return (0);
+	o = options_get(s->options, "@menu-bar");
+	if (o == NULL)
+		return (0);
+	v = options_get_string(s->options, "@menu-bar");
+	if (v == NULL || *v == '\0' ||
+	    strcmp(v, "off") == 0 || strcmp(v, "0") == 0)
+		return (0);
+	return (1);
+}
+
+/* MENU BAR: build the rendered format string (Turbo Vision theme + ranges). */
+char *
+menu_bar_build(void)
+{
+	char		*s, *tmp;
+	const char	*title;
+	u_int		 i;
+	int		 pos;
+
+	xasprintf(&s, "#[%s,bold]", MENU_BAR_STYLE);
+	for (i = 0; i < MENU_BAR_COUNT; i++) {
+		title = menu_bar_menus[i].title;
+		/* Find the mnemonic letter (case-insensitive) to colour red. */
+		pos = -1;
+		if (menu_bar_menus[i].mnemonic != '\0') {
+			const char *p = title;
+			while (*p != '\0') {
+				if (tolower((u_char)*p) ==
+				    tolower((u_char)menu_bar_menus[i].mnemonic)) {
+					pos = (int)(p - title);
+					break;
+				}
+				p++;
+			}
+		}
+		if (pos < 0) {
+			xasprintf(&tmp, "%s#[range=user|menu_%u] %s #[norange]",
+			    s, i, title);
+		} else {
+			xasprintf(&tmp,
+			    "%s#[range=user|menu_%u] %.*s%s%c#[fg=#000000]%s "
+			    "#[norange]", s, i, pos, title, MENU_BAR_MNEMONIC,
+			    title[pos], title + pos + 1);
+		}
+		free(s);
+		s = tmp;
+	}
+	return (s);
+}
+
+/* MENU BAR: column where the top-level menu at idx starts (from its range). */
+static u_int
+menu_bar_index_x(struct client *c, u_int idx)
+{
+	struct style_range	*sr;
+	char			 name[16];
+
+	xsnprintf(name, sizeof name, "menu_%u", idx);
+	TAILQ_FOREACH(sr, &c->menubar_ranges, entry) {
+		if (sr->type == STYLE_RANGE_USER &&
+		    strcmp(sr->string, name) == 0)
+			return (sr->start);
+	}
+	return (0);
+}
+
+/* MENU BAR: handle Alt+mnemonic to open a menu from the keyboard. */
+int
+menu_bar_key(struct client *c, key_code key)
+{
+	u_int	i;
+	char	ch;
+
+	if (menu_bar_size(c) == 0 || c->overlay_draw != NULL)
+		return (0);
+	if (!(key & KEYC_META))
+		return (0);
+	if ((key & KEYC_MASK_KEY) > 0x7f)
+		return (0);
+	ch = (char)(key & KEYC_MASK_KEY);
+	for (i = 0; i < MENU_BAR_COUNT; i++) {
+		if (menu_bar_menus[i].mnemonic != '\0' &&
+		    tolower((u_char)ch) ==
+		    tolower((u_char)menu_bar_menus[i].mnemonic)) {
+			menu_bar_open(c, i, menu_bar_index_x(c, i));
+			return (1);
+		}
+	}
+	return (0);
+}
+
+/* MENU BAR: open the dropdown for menu index at column px (native, in C). */
+void
+menu_bar_open(struct client *c, u_int idx, u_int px)
+{
+	const struct menu_bar_def	*def;
+	struct menu			*menu;
+	struct menu_item		 it;
+	struct cmd_find_state		 fs;
+	u_int				 i;
+
+	if (idx >= MENU_BAR_COUNT)
+		return;
+	def = &menu_bar_menus[idx];
+
+	cmd_find_from_client(&fs, c, 0);
+	menu = menu_create(def->title);
+	for (i = 0; i < def->count; i++) {
+		memset(&it, 0, sizeof it);
+		it.name = def->items[i].name;
+		it.key = (def->items[i].name != NULL) ?
+		    def->items[i].key : KEYC_NONE;
+		it.command = def->items[i].command;
+		menu_add_item(menu, &it, NULL, c, &fs);
+	}
+	if (menu->count == 0) {
+		menu_free(menu);
+		return;
+	}
+	if (menu_display_menubar(menu, 0, NULL, px, 1, c, BOX_LINES_DEFAULT,
+	    MENU_BAR_MENU_STYLE, MENU_BAR_SELECTED_STYLE,
+	    MENU_BAR_BORDER_STYLE, &fs, idx) != 0)
+		menu_free(menu);
+}
+
+/*
+ * DESKTOP: Turbo Vision style desktop. When @desktop is on, the window is
+ * inset from the screen edges; the surrounding area is painted as a hatched
+ * blue desktop and the window content is wrapped in a framed, titled box.
+ */
+#define DESKTOP_TOP	2	/* reserved rows above content (incl. title) */
+#define DESKTOP_BOTTOM	2
+#define DESKTOP_LEFT	3	/* reserved cols left of content */
+#define DESKTOP_RIGHT	3
+
+int
+desktop_inset(struct client *c, u_int *top, u_int *bottom, u_int *left,
+    u_int *right)
+{
+	struct session		*s = c->session;
+	struct options_entry	*o;
+	const char		*v;
+
+	if (top != NULL)
+		*top = *bottom = *left = *right = 0;
+	if (c->flags & (CLIENT_STATUSOFF|CLIENT_CONTROL))
+		return (0);
+	if (s == NULL)
+		return (0);
+	o = options_get(s->options, "@desktop");
+	if (o == NULL)
+		return (0);
+	v = options_get_string(s->options, "@desktop");
+	if (v == NULL || *v == '\0' ||
+	    strcmp(v, "off") == 0 || strcmp(v, "0") == 0)
+		return (0);
+	if (c->tty.sx < DESKTOP_LEFT + DESKTOP_RIGHT + 10 ||
+	    c->tty.sy < DESKTOP_TOP + DESKTOP_BOTTOM + 6)
+		return (0); /* too small; disable to stay safe */
+	if (top != NULL) {
+		*top = DESKTOP_TOP;
+		*bottom = DESKTOP_BOTTOM;
+		*left = DESKTOP_LEFT;
+		*right = DESKTOP_RIGHT;
+	}
+	return (1);
+}
+
+/* DESKTOP: is the desktop enabled and is the terminal big enough? */
+int
+desktop_enabled(struct client *c)
+{
+	struct session		*s = c->session;
+	struct options_entry	*o;
+	const char		*v;
+
+	if (c->flags & (CLIENT_STATUSOFF|CLIENT_CONTROL))
+		return (0);
+	if (s == NULL)
+		return (0);
+	o = options_get(s->options, "@desktop");
+	if (o == NULL)
+		return (0);
+	v = options_get_string(s->options, "@desktop");
+	if (v == NULL || *v == '\0' ||
+	    strcmp(v, "off") == 0 || strcmp(v, "0") == 0)
+		return (0);
+	if (c->tty.sx < 24 ||
+	    c->tty.sy < status_line_size(c) + menu_bar_size(c) + 8)
+		return (0);
+	return (1);
+}
+
+/*
+ * DESKTOP: get the floating window rectangle (desktop-area coords). Lazily
+ * initialises to a centred window and clamps it inside the desktop area.
+ */
+int
+desktop_get_rect_w(struct client *c, struct window *w, u_int *x, u_int *y,
+    u_int *ww, u_int *hh)
+{
+	u_int	area_w, area_h, off, dx, dy, dw, dh;
+
+	if (!desktop_enabled(c) || w == NULL || w->desktop_ph)
+		return (0);
+	area_w = c->tty.sx;
+	area_h = c->tty.sy - status_line_size(c) - menu_bar_size(c);
+	if (area_w < 24 || area_h < 8)
+		return (0);
+
+	if (w->desktop_w == 0 || w->desktop_h == 0) {
+		w->desktop_w = (area_w * 3) / 4;
+		w->desktop_h = (area_h * 3) / 4;
+		if (w->desktop_w < 20)
+			w->desktop_w = area_w;
+		if (w->desktop_h < 6)
+			w->desktop_h = area_h;
+		off = w->id % 5; /* cascade like Turbo Vision */
+		w->desktop_x = (area_w - w->desktop_w) / 2 + off * 2;
+		w->desktop_y = (area_h - w->desktop_h) / 2 + off;
+	}
+
+	/*
+	 * PERSISTENCE: clamp to the current area for DISPLAY only, in locals -
+	 * never overwrite the stored (desired) rect. That way the window is
+	 * restored verbatim when the space comes back (e.g. detaching, then
+	 * re-attaching on a larger terminal after a smaller one). On the same
+	 * size, the returned rect is identical to what the user set.
+	 */
+	dx = w->desktop_x;
+	dy = w->desktop_y;
+	dw = w->desktop_w;
+	dh = w->desktop_h;
+	/*
+	 * A maximised window fills the desktop area BY DEFINITION, so recompute
+	 * it instead of trusting what was stored when it was maximised: the
+	 * area grows and shrinks when the menu bar or the status line is
+	 * toggled, and a stale size left a strip of desktop showing along the
+	 * bottom. The restore rect (desktop_z*) is untouched.
+	 */
+	if (w->desktop_zoomed) {
+		dx = 0;
+		dy = 0;
+		dw = area_w;
+		dh = area_h;
+	}
+	if (dw > area_w)
+		dw = area_w;
+	if (dh > area_h)
+		dh = area_h;
+	if (dx + dw > area_w)
+		dx = area_w - dw;
+	if (dy + dh > area_h)
+		dy = area_h - dh;
+
+	*x = dx;
+	*y = dy;
+	*ww = dw;
+	*hh = dh;
+	return (1);
+}
+
+/*
+ * DESKTOP: maximise/restore a window, the one place that does it. The restore
+ * rect (desktop_z*) is saved on the way up and put back on the way down, so a
+ * maximised window always comes back exactly where it was - whichever gesture
+ * asked for it (the [^] box, a double click on the title bar, a key binding).
+ */
+void
+desktop_toggle_zoom(struct client *c, struct window *w)
+{
+	u_int	aw, ah;
+
+	if (w == NULL || !desktop_get_area(c, &aw, &ah))
+		return;
+	if (w->desktop_zoomed) {
+		w->desktop_x = w->desktop_zx;
+		w->desktop_y = w->desktop_zy;
+		w->desktop_w = w->desktop_zw;
+		w->desktop_h = w->desktop_zh;
+		w->desktop_zoomed = 0;
+	} else {
+		w->desktop_zx = w->desktop_x;
+		w->desktop_zy = w->desktop_y;
+		w->desktop_zw = w->desktop_w;
+		w->desktop_zh = w->desktop_h;
+		w->desktop_x = 0;
+		w->desktop_y = 0;
+		w->desktop_w = aw;
+		w->desktop_h = ah;
+		w->desktop_zoomed = 1;
+	}
+	recalculate_sizes();
+	server_redraw_client(c);
+}
+
+/* DESKTOP: full desktop area size (cols/rows available for windows). */
+int
+desktop_get_area(struct client *c, u_int *aw, u_int *ah)
+{
+	u_int	area_w, area_h;
+
+	if (!desktop_enabled(c))
+		return (0);
+	area_w = c->tty.sx;
+	area_h = c->tty.sy - status_line_size(c) - menu_bar_size(c);
+	if (area_w < 24 || area_h < 8)
+		return (0);
+	*aw = area_w;
+	*ah = area_h;
+	return (1);
+}
+
+int
+desktop_get_rect(struct client *c, u_int *x, u_int *y, u_int *w, u_int *h)
+{
+	if (c->session == NULL || c->session->curw == NULL)
+		return (0);
+	return (desktop_get_rect_w(c, c->session->curw->window, x, y, w, h));
+}
+
+u_int
+desktop_top(struct client *c)
+{
+	u_int	x, y, w, h;
+
+	return (desktop_get_rect(c, &x, &y, &w, &h) ? y + 1 : 0);
+}
+
+u_int
+desktop_left(struct client *c)
+{
+	u_int	x, y, w, h;
+
+	return (desktop_get_rect(c, &x, &y, &w, &h) ? x + 1 : 0);
+}
+
+u_int
+desktop_vert_w(struct client *c, struct window *w)
+{
+	u_int	x, y, ww, hh, area_h;
+
+	if (!desktop_get_rect_w(c, w, &x, &y, &ww, &hh))
+		return (0);
+	area_h = c->tty.sy - status_line_size(c) - menu_bar_size(c);
+	return (area_h - (hh - 2));
+}
+
+u_int
+desktop_horiz_w(struct client *c, struct window *w)
+{
+	u_int	x, y, ww, hh;
+
+	if (!desktop_get_rect_w(c, w, &x, &y, &ww, &hh))
+		return (0);
+	/* A manager window also gives up its list column + band. */
+	return (c->tty.sx - (ww - 2) + claude_inset(c, w));
+}
+
+/* CLAUDE: is this window the conversation manager? */
+int
+claude_manager(struct window *w)
+{
+	return (w != NULL && w->claude_mgr);
+}
+
+/*
+ * CLAUDE: width of the conversation list column, clamped so the conversation
+ * itself always keeps room. 0 when this is not a manager window (or the
+ * window is too narrow to split at all).
+ */
+u_int
+claude_list_width(struct client *c, struct window *w)
+{
+	u_int	x, y, ww, hh, lw;
+
+	if (!claude_manager(w) || !desktop_get_rect_w(c, w, &x, &y, &ww, &hh))
+		return (0);
+	if (ww < 2 + 12 + 8)		/* frame + conversation + list */
+		return (0);
+	lw = (w->claude_listw != 0) ? w->claude_listw : CLAUDE_LISTW;
+	if (lw > ww - 2 - 12)
+		lw = ww - 2 - 12;
+	if (lw < 8)
+		lw = 8;
+	return (lw);
+}
+
+/*
+ * DESKTOP: is this window the empty-desktop placeholder? Turbo Vision leaves a
+ * bare desktop when the last window is closed; tmux would instead destroy the
+ * session (and, with the last session, the server). The placeholder is a window
+ * kept alive with a single DEAD pane and drawn as nothing at all.
+ */
+int
+desktop_placeholder(struct window *w)
+{
+	return (w != NULL && w->desktop_ph);
+}
+
+/*
+ * DESKTOP: is the windowed mode requested for this session? Unlike
+ * desktop_enabled(), this asks the SESSION and not a client, so it also holds
+ * while the session is detached - a detached session must not lose its desktop
+ * (and itself) just because its last shell exited.
+ */
+int
+desktop_session_on(struct session *s)
+{
+	struct options_entry	*o;
+	const char		*v;
+
+	if (s == NULL)
+		return (0);
+	if ((o = options_get(s->options, "@desktop")) == NULL)
+		return (0);
+	v = options_get_string(s->options, "@desktop");
+	if (v == NULL || *v == '\0' ||
+	    strcmp(v, "off") == 0 || strcmp(v, "0") == 0)
+		return (0);
+	return (1);
+}
+
+/*
+ * DESKTOP: should closing this window leave an empty desktop instead of ending
+ * the session? Only for the simple, real case: the window belongs to exactly
+ * one session and it is that session's last window, with the windowed mode on.
+ */
+int
+desktop_keep_window(struct window *w)
+{
+	struct session	*s, *found = NULL;
+
+	/* A window with no pane left cannot be kept: there is nothing to hold. */
+	if (w == NULL || w->desktop_ph || TAILQ_EMPTY(&w->panes))
+		return (0);
+
+	RB_FOREACH(s, sessions, &sessions) {
+		if (!session_has(s, w))
+			continue;
+		if (found != NULL)
+			return (0);	/* linked in several sessions */
+		found = s;
+	}
+	if (found == NULL || winlink_count(&found->windows) != 1)
+		return (0);
+	return (desktop_session_on(found));
+}
+
+/*
+ * DESKTOP: turn a window into the empty-desktop placeholder. Its panes are
+ * reduced to one, whose process is hung up by closing the pty - the pane OBJECT
+ * stays (like remain-on-exit), which is what keeps the window, the session and
+ * the server alive with nothing displayed.
+ */
+void
+desktop_make_placeholder(struct window *w)
+{
+	struct window_pane	*wp;
+
+	if (w == NULL || w->desktop_ph)
+		return;
+
+	/* Reduce to a single pane, exactly as respawning a window does. */
+	if ((wp = TAILQ_FIRST(&w->panes)) != NULL) {
+		TAILQ_REMOVE(&w->panes, wp, entry);
+		layout_free(w);
+		window_destroy_panes(w);
+		TAILQ_INSERT_HEAD(&w->panes, wp, entry);
+		window_pane_resize(wp, w->sx, w->sy);
+		layout_init(w, wp);
+		w->active = NULL;
+		window_set_active_pane(w, wp, 0);
+
+		window_pane_reset_mode_all(wp);
+		if (wp->fd != -1) {
+			bufferevent_free(wp->event);
+			wp->event = NULL;
+			close(wp->fd);	/* SIGHUP to the process group */
+			wp->fd = -1;
+		}
+		wp->base.mode &= ~MODE_CURSOR;	/* no cursor on a bare desktop */
+	}
+
+	w->flags &= ~WINDOW_ZOOMED;
+	w->desktop_ph = 1;
+	free(w->name);
+	w->name = xstrdup("Bureau");
+	options_set_number(w->options, "automatic-rename", 0);
+	server_redraw_window(w);
+}
+
+/*
+ * CLAUDE: geometry of the scrollable part of the manager list. The header and
+ * the "[+ Nouvelle]" button are pinned, everything between them scrolls:
+ * conversations, then the "Reprendre" section. Returns the viewport height, the
+ * number of items and the scroll range (0 = everything fits).
+ */
+int
+claude_list_geom(struct client *c, struct window *w, u_int *vh, u_int *total,
+    u_int *range)
+{
+	u_int	x, y, ww, hh, ih, nconv, nsess, t;
+
+	if (!claude_manager(w) || !desktop_get_rect_w(c, w, &x, &y, &ww, &hh))
+		return (0);
+	ih = (hh > 2) ? hh - 2 : 0;
+	if (ih < 3)
+		return (0);
+
+	nconv = window_count_panes(w);
+	nsess = claude_sess_count();
+	t = nconv + (nsess != 0 ? 1 + nsess : 0);
+
+	*vh = ih - 2;			/* header and button are pinned */
+	*total = t;
+	*range = (t > *vh) ? t - *vh : 0;
+
+	/* A shrinking list must not leave the view past the end. */
+	if (w->claude_scroll > *range)
+		w->claude_scroll = *range;
+	return (1);
+}
+
+/*
+ * CLAUDE: where the list's own scrollbar goes - the LAST column of the list
+ * column, alongside the viewport, exactly like a pane's bar takes its last
+ * content column. Returns 0 when there is nothing to scroll.
+ */
+int
+claude_list_scrollbar(struct client *c, struct window *w, u_int rx, u_int ry,
+    __unused u_int rw, __unused u_int rh, u_int *bx, u_int *by, u_int *bsize)
+{
+	u_int	lw = claude_list_width(c, w), vh, total, range;
+
+	if (lw < 4 || !claude_list_geom(c, w, &vh, &total, &range))
+		return (0);
+	if (range == 0 || vh < 3)
+		return (0);
+	*bx = rx + lw;			/* last column of the list */
+	*by = ry + 2;			/* first scrollable row */
+	*bsize = vh;
+	return (1);
+}
+
+/* CLAUDE: scroll the list by delta rows, clamped. */
+void
+claude_list_scroll(struct window *w, int delta)
+{
+	struct client	*c;
+	u_int		 vh, total, range;
+	int		 v;
+
+	if (w == NULL)
+		return;
+	TAILQ_FOREACH(c, &clients, entry) {
+		if (c->session != NULL && c->session->curw != NULL &&
+		    c->session->curw->window == w)
+			break;
+	}
+	if (c == NULL || !claude_list_geom(c, w, &vh, &total, &range))
+		return;
+	v = (int)w->claude_scroll + delta;
+	if (v < 0)
+		v = 0;
+	if (v > (int)range)
+		v = (int)range;
+	w->claude_scroll = (u_int)v;
+	server_redraw_client(c);
+}
+
+/* CLAUDE: thumb dragged to row p of a track of `track` cells. */
+void
+claude_list_scroll_to(struct window *w, u_int p, u_int track)
+{
+	struct client	*c;
+	u_int		 vh, total, range;
+
+	if (w == NULL)
+		return;
+	TAILQ_FOREACH(c, &clients, entry) {
+		if (c->session != NULL && c->session->curw != NULL &&
+		    c->session->curw->window == w)
+			break;
+	}
+	if (c == NULL || !claude_list_geom(c, w, &vh, &total, &range))
+		return;
+	w->claude_scroll = scrollbar_value(p, range, track);
+	if (w->claude_scroll > range)
+		w->claude_scroll = range;
+	server_redraw_client(c);
+}
+
+/*
+ * CLAUDE: what the manager list holds on interior row `lrow` (0 = the row just
+ * under the title bar). The drawing and the mouse BOTH go through this: two
+ * separate layouts drift apart, and a click then lands one row off.
+ *
+ * Layout:   0            "Conversations"
+ *           1..n         the live conversations
+ *           n+1          "Reprendre" (only when there are saved sessions)
+ *           n+2..        the saved sessions, most recent first
+ *           ih-1         the "[+ Nouvelle]" button, pinned at the bottom
+ */
+enum claude_row
+claude_list_row(struct client *c, struct window *w, u_int lrow, u_int *index)
+{
+	u_int	x, y, ww, hh, ih, nconv, first, nsess, item, vh, total, range;
+
+	*index = 0;
+	if (!claude_manager(w) || !desktop_get_rect_w(c, w, &x, &y, &ww, &hh))
+		return (CLAUDE_ROW_NONE);
+	ih = (hh > 2) ? hh - 2 : 0;
+	if (ih < 3 || lrow >= ih)
+		return (CLAUDE_ROW_NONE);
+	if (lrow == ih - 1)
+		return (CLAUDE_ROW_NEW);
+	if (lrow == 0)
+		return (CLAUDE_ROW_HEADER);
+
+	/* Row 1 shows item `claude_scroll`, so the view can slide. */
+	if (!claude_list_geom(c, w, &vh, &total, &range))
+		return (CLAUDE_ROW_NONE);
+	item = (lrow - 1) + w->claude_scroll;
+	if (item >= total)
+		return (CLAUDE_ROW_NONE);
+
+	nconv = window_count_panes(w);
+	if (item < nconv) {
+		*index = item;
+		return (CLAUDE_ROW_CONV);
+	}
+	if ((nsess = claude_sess_count()) == 0)
+		return (CLAUDE_ROW_NONE);
+	if (item == nconv)
+		return (CLAUDE_ROW_SESSHDR);
+	first = nconv + 1;
+	if (item > nconv && item - first < nsess) {
+		*index = item - first;
+		return (CLAUDE_ROW_SESS);
+	}
+	return (CLAUDE_ROW_NONE);
+}
+
+/* CLAUDE: columns taken from the pane area (list column + its band). */
+u_int
+claude_inset(struct client *c, struct window *w)
+{
+	u_int	lw = claude_list_width(c, w);
+
+	return ((lw == 0) ? 0 : lw + 1);
+}
+
+/*
+ * CLAUDE: the conversations a manager hides keep the size of the one it
+ * shows. Hidden, a pane is never drawn, so nothing obliges it to keep its
+ * cell of the tiled layout - and with thirty conversations that cell was
+ * 24x5: Claude Code could not draw its prompt there, so the delivery never
+ * found an agent "at its prompt" and mail stayed pending (a console captured
+ * there was cut as well).
+ */
+void
+claude_hidden_fit(struct window *w)
+{
+	struct window_pane	*wp, *act = w->active;
+
+	if (!(w->flags & WINDOW_ZOOMED) || act == NULL ||
+	    act->layout_cell == NULL)
+		return;
+	TAILQ_FOREACH(wp, &w->panes, entry) {
+		if (wp != act && wp->layout_cell == NULL)
+			window_pane_resize(wp, act->sx, act->sy);
+	}
+}
+
+/*
+ * CLAUDE: show `want` in a zoomed manager window by handing it the zoom cell -
+ * no unzoom: that would put every hidden conversation back in its small tiled
+ * cell and then back to full size, making all the agents redraw twice for a
+ * click. The tiled layout kept aside for the unzoom is left untouched.
+ */
+static int
+claude_zoom_switch(struct window *w, struct window_pane *want)
+{
+	struct window_pane	*wp, *from = NULL;
+	struct layout_cell	*lc;
+
+	if (!(w->flags & WINDOW_ZOOMED))
+		return (0);
+	TAILQ_FOREACH(wp, &w->panes, entry) {
+		if (wp->layout_cell != NULL) {
+			from = wp;
+			break;
+		}
+	}
+	if (from == NULL)
+		return (0);
+	if (from != want) {
+		lc = from->layout_cell;
+		from->layout_cell = NULL;
+		lc->wp = want;
+		want->layout_cell = lc;
+	}
+	if (w->active != want)
+		window_set_active_pane(w, want, 1);
+	layout_fix_panes(w, NULL);
+	claude_hidden_fit(w);
+	return (1);
+}
+
+/*
+ * CLAUDE: a manager window always shows exactly ONE conversation, so keep it
+ * zoomed on the active pane. tmux unzooms a window whenever a pane dies or is
+ * split, which would otherwise tile every conversation side by side.
+ */
+int
+claude_fix_zoom(struct window *w)
+{
+	if (!claude_manager(w) || w->active == NULL)
+		return (0);
+	/*
+	 * Never touch a window that nothing references any more: window_zoom()
+	 * notifies, a notification takes a reference, and on a dying window
+	 * that resurrects it - the notify callback then drops the last
+	 * reference a second time and frees it twice (double-free found with
+	 * AddressSanitizer on "Fichier > Tuer le serveur" = kill-server).
+	 */
+	if (w->references == 0)
+		return (0);
+	if (window_count_panes(w) <= 1)
+		return (0);
+	/* Already zoomed ON THE ACTIVE pane: only it keeps a layout cell. */
+	if ((w->flags & WINDOW_ZOOMED) && w->active->layout_cell != NULL)
+		return (0);
+	/* Zoomed on some other pane: hand it the zoom cell. */
+	if (claude_zoom_switch(w, w->active))
+		return (1);
+	window_zoom(w->active);
+	return (1);			/* caller resizes, outside any loop */
+}
+
+/*
+ * CLAUDE: show conversation `row` (index in the pane list) - the window is
+ * kept zoomed on it, so the others keep running but stay hidden.
+ */
+void
+claude_select_row(struct client *c, struct window *w, u_int row)
+{
+	struct window_pane	*wp, *want = NULL;
+	u_int			 i = 0;
+
+	TAILQ_FOREACH(wp, &w->panes, entry) {
+		if (i++ == row) {
+			want = wp;
+			break;
+		}
+	}
+	if (want == NULL)
+		return;
+
+	/*
+	 * Already the conversation on screen: do nothing. Going through
+	 * unzoom/zoom/recalculate would resize the pane for nothing, and the
+	 * agent running there would be told to redraw (SIGWINCH) each time the
+	 * user clicks its name.
+	 */
+	if (want == w->active &&
+	    (window_count_panes(w) <= 1 ||
+	    ((w->flags & WINDOW_ZOOMED) && want->layout_cell != NULL))) {
+		if (want->claude_unread) {
+			claude_mark_read(want);
+			server_redraw_client(c);
+		}
+		log_debug("%s: %%%u already shown", __func__, want->id);
+		return;
+	}
+
+	if (!claude_zoom_switch(w, want)) {
+		if (w->flags & WINDOW_ZOOMED)
+			window_unzoom(w);
+		window_set_active_pane(w, want, 1);
+		if (window_count_panes(w) > 1)
+			window_zoom(want);
+	}
+	claude_mark_read(want);		/* showing it clears its ✉ */
+	recalculate_sizes();
+	server_redraw_client(c);
+}
+
+u_int
+desktop_vert(struct client *c)
+{
+	if (c->session == NULL || c->session->curw == NULL)
+		return (0);
+	return (desktop_vert_w(c, c->session->curw->window));
+}
+
+u_int
+desktop_horiz(struct client *c)
+{
+	if (c->session == NULL || c->session->curw == NULL)
+		return (0);
+	return (desktop_horiz_w(c, c->session->curw->window));
+}
+
+/* MENU BAR: get the clickable range at column x on the menu bar. */
+struct style_range *
+menu_bar_get_range(struct client *c, u_int x)
+{
+	struct style_range	*sr;
+
+	TAILQ_FOREACH(sr, &c->menubar_ranges, entry) {
+		if (x >= sr->start && x < sr->end)
+			return (sr);
+	}
+	return (NULL);
+}
+
 /* Get the prompt line number for client's session. 1 means at the bottom. */
 static u_int
 status_prompt_line_at(struct client *c)
@@ -291,7 +1314,7 @@ status_get_range(struct client *c, u_int x, u_int y)
 }
 
 /* Free all ranges. */
-static void
+void
 status_free_ranges(struct style_ranges *srs)
 {
 	struct style_range	*sr, *sr1;
@@ -338,6 +1361,11 @@ status_init(struct client *c)
 	for (i = 0; i < nitems(sl->entries); i++)
 		TAILQ_INIT(&sl->entries[i].ranges);
 
+	TAILQ_INIT(&c->menubar_ranges); /* MENU BAR */
+
+	screen_init(&c->desktop_buffer, 1, 1, 0); /* DESKTOP back-buffer */
+	c->desktop_buffer_valid = 0;
+
 	screen_init(&sl->screen, c->tty.sx, 1, 0);
 	sl->active = &sl->screen;
 }
@@ -353,6 +1381,9 @@ status_free(struct client *c)
 		status_free_ranges(&sl->entries[i].ranges);
 		free((void *)sl->entries[i].expanded);
 	}
+
+	status_free_ranges(&c->menubar_ranges); /* MENU BAR */
+	screen_free(&c->desktop_buffer); /* DESKTOP back-buffer */
 
 	if (event_initialized(&sl->timer))
 		evtimer_del(&sl->timer);
@@ -488,6 +1519,21 @@ status_message_set(struct client *c, int delay, int ignore_styles,
 		return;
 	}
 
+	/*
+	 * Turbo Vision desktop: the message goes in a box that closes by
+	 * itself after display-time (0 = wait for OK/Escape), the status
+	 * bar is left alone.
+	 */
+	if (c->session != NULL && desktop_enabled(c)) {
+		server_add_message("%s message: %s", c->name, s);
+		if (delay == -1)
+			delay = options_get_number(c->session->options,
+			    "display-time");
+		message_dialog(c, s, (delay > 0) ? delay : 0);
+		free(s);
+		return;
+	}
+
 	status_message_clear(c);
 	status_push_screen(c);
 	c->message_string = s;
@@ -606,6 +1652,7 @@ status_prompt_set(struct client *c, struct cmd_find_state *fs,
 {
 	struct format_tree	*ft;
 	char			*tmp;
+	int			 boxed;
 
 	if (fs != NULL)
 		ft = format_create_from_state(NULL, c, fs);
@@ -621,7 +1668,15 @@ status_prompt_set(struct client *c, struct cmd_find_state *fs,
 
 	status_message_clear(c);
 	status_prompt_clear(c);
-	status_push_screen(c);
+	/*
+	 * Turbo Vision desktop: the prompt goes in an input box and the
+	 * status bar keeps drawing normally, so no temporary status screen
+	 * is pushed for it (the push/pop is reference-counted and must stay
+	 * balanced with status_prompt_clear()).
+	 */
+	boxed = ((~flags & PROMPT_SINGLE) && desktop_enabled(c));
+	if (!boxed)
+		status_push_screen(c);
 
 	c->prompt_string = format_expand_time(ft, msg);
 
@@ -651,6 +1706,10 @@ status_prompt_set(struct client *c, struct cmd_find_state *fs,
 	if (flags & PROMPT_INCREMENTAL)
 		c->prompt_inputcb(c, c->prompt_data, "=", 0);
 
+	/* Show the prompt in the input box; too small -> classic line prompt. */
+	if (boxed && c->prompt_string != NULL && !prompt_dialog_open(c))
+		status_push_screen(c);
+
 	free(tmp);
 	format_free(ft);
 }
@@ -659,6 +1718,8 @@ status_prompt_set(struct client *c, struct cmd_find_state *fs,
 void
 status_prompt_clear(struct client *c)
 {
+	int	boxed = c->prompt_dialog;	/* no status screen was pushed */
+
 	if (c->prompt_string == NULL)
 		return;
 
@@ -670,6 +1731,7 @@ status_prompt_clear(struct client *c)
 
 	free(c->prompt_string);
 	c->prompt_string = NULL;
+	c->prompt_dialog = 0;
 
 	free(c->prompt_buffer);
 	c->prompt_buffer = NULL;
@@ -680,7 +1742,8 @@ status_prompt_clear(struct client *c)
 	c->tty.flags &= ~(TTY_NOCURSOR|TTY_FREEZE);
 	c->flags |= CLIENT_ALLREDRAWFLAGS; /* was frozen and may have changed */
 
-	status_pop_screen(c);
+	if (!boxed)
+		status_pop_screen(c);
 }
 
 /* Update status line prompt with a new prompt string. */

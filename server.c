@@ -24,6 +24,7 @@
 #include <sys/wait.h>
 
 #include <errno.h>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -198,6 +199,7 @@ server_start(struct tmuxproc *client, int flags, struct event_base *base,
 	server_proc = proc_start("server");
 
 	proc_set_signals(server_proc, server_signal);
+	server_set_crash_handler();	/* backtrace to ~/.tmuxv-crash.log */
 	sigprocmask(SIG_SETMASK, &oldset, NULL);
 
 	if (log_get_level() > 1)
@@ -212,17 +214,33 @@ server_start(struct tmuxproc *client, int flags, struct event_base *base,
 	TAILQ_INIT(&clients);
 	RB_INIT(&sessions);
 	key_bindings_init();
+	swap_init();		/* idle panes to swap, if the cgroup allows */
+	bus_init(base);		/* the agent bus: HTTP + database thread */
 	TAILQ_INIT(&message_log);
 	gettimeofday(&start_time, NULL);
 
+	if (server_upgrade_file != NULL)
+		server_upgrade_socket = upgrade_peek_socket(server_upgrade_file);
+	if (server_upgrade_file != NULL && server_upgrade_socket != -1) {
+		/*
+		 * HOT UPGRADE: the previous binary's listening socket came
+		 * through the exec - creating a new one would fight it for the
+		 * same path and drop every client mid-flight.
+		 */
+		server_fd = server_upgrade_socket;
+		setblocking(server_fd, 0);
+	} else {
 #ifdef HAVE_SYSTEMD
-	server_fd = systemd_create_socket(flags, &cause);
+		server_fd = systemd_create_socket(flags, &cause);
 #else
-	server_fd = server_create_socket(flags, &cause);
+		server_fd = server_create_socket(flags, &cause);
 #endif
-	if (server_fd != -1)
-		server_update_socket();
-	if (~flags & CLIENT_NOFORK)
+		if (server_fd != -1)
+			server_update_socket();
+	}
+	if (server_upgrade_file != NULL)
+		options_set_number(global_options, "exit-empty", 0);
+	else if (~flags & CLIENT_NOFORK)
 		c = server_client_create(fd);
 	else
 		options_set_number(global_options, "exit-empty", 0);
@@ -249,7 +267,27 @@ server_start(struct tmuxproc *client, int flags, struct event_base *base,
 	server_acl_init();
 
 	server_add_accept(0);
+
+	/* HOT UPGRADE: rebuild everything around the inherited descriptors. */
+	if (server_upgrade_file != NULL) {
+		upgrade_load(server_upgrade_file);
+		server_upgrade_file = NULL;
+	} else if (upgrade_enabled() && upgrade_restore_cold()) {
+		/*
+		 * CRASH RECOVERY: a state file was still there, so the
+		 * previous server did not exit cleanly - bring the sessions
+		 * back before anyone attaches.
+		 */
+		log_debug("%s: restored after an unclean shutdown", __func__);
+	}
+	if (upgrade_enabled())
+		upgrade_save_start();
+	swap_start();
+
 	proc_loop(server_proc, server_loop);
+
+	/* Clean exit: drop the state file, so the next start does not restore. */
+	upgrade_save_clean();
 
 	job_kill_all();
 	status_prompt_save_history();
@@ -327,6 +365,13 @@ server_send_exit(void)
 }
 
 /* Update socket execute permissions based on whether sessions are attached. */
+/* HOT UPGRADE: the listening socket, handed to the next binary as is. */
+int
+server_upgrade_socket_fd(void)
+{
+	return (server_fd);
+}
+
 void
 server_update_socket(void)
 {
@@ -424,6 +469,60 @@ server_add_accept(int timeout)
 	}
 }
 
+/*
+ * Crash handler: a segfault leaves nothing behind (the server daemonises into
+ * "/" so a core cannot be written), which makes user-reported crashes
+ * impossible to diagnose. Append a backtrace to ~/.tmuxv-crash.log instead,
+ * using only async-signal-safe calls, then die with the original signal so
+ * the exit status is unchanged.
+ */
+static void
+server_crash_handler(int sig)
+{
+	void		*frames[64];
+	int		 n, fd;
+	const char	*home;
+	char		 path[PATH_MAX], head[64];
+
+	home = getenv("HOME");
+	if (home == NULL || *home == '\0')
+		home = "/tmp";
+	if ((size_t)snprintf(path, sizeof path, "%s/.tmuxv-crash.log", home) <
+	    sizeof path) {
+		fd = open(path, O_WRONLY|O_CREAT|O_APPEND, 0600);
+		if (fd != -1) {
+			n = snprintf(head, sizeof head,
+			    "\n=== tmuxv: signal %d, pid %ld ===\n", sig,
+			    (long)getpid());
+			if (n > 0)
+				(void)write(fd, head, n);
+			n = backtrace(frames, nitems(frames));
+			backtrace_symbols_fd(frames, n, fd);
+			close(fd);
+		}
+	}
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+void
+server_set_crash_handler(void)
+{
+	signal(SIGSEGV, server_crash_handler);
+	signal(SIGBUS, server_crash_handler);
+	signal(SIGFPE, server_crash_handler);
+	signal(SIGILL, server_crash_handler);
+	signal(SIGABRT, server_crash_handler);
+}
+
+/*
+ * Set by kill-server (which signals itself): the user WANTS the server gone,
+ * so the state file goes too. Any other SIGTERM comes from outside - systemd
+ * stopping the user's scope at logout, a shutdown - and the conversations
+ * must come back at the next start.
+ */
+int	server_kill_asked;
+
 /* Signal handler. */
 static void
 server_signal(int sig)
@@ -434,6 +533,16 @@ server_signal(int sig)
 	switch (sig) {
 	case SIGINT:
 	case SIGTERM:
+		/*
+		 * Not a snapshot now: the whole scope gets the signal at once,
+		 * the conversations may already be dying - the last periodic
+		 * one (all of them, at most @restore-interval old) is kept.
+		 */
+		if (!server_kill_asked) {
+			log_debug("%s: stopped from outside, state kept",
+			    __func__);
+			upgrade_save_keep();
+		}
 		server_exit = 1;
 		server_send_exit();
 		break;

@@ -19,6 +19,7 @@
 #include <sys/types.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -219,6 +220,7 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	struct winsize		  ws;
 	sigset_t		  set, oldset;
 	key_code		  key;
+	int			  oom_score;
 
 	spawn_log(__func__, sc);
 
@@ -353,6 +355,18 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	ws.ws_xpixel = w->xpixel * ws.ws_col;
 	ws.ws_ypixel = w->ypixel * ws.ws_row;
 
+	/* MEMORY: read the OOM score in the parent - options live here. */
+	oom_score = 0;
+	if (s != NULL && options_get(s->options, "@oom-score") != NULL) {
+		const char	*v = options_get_string(s->options, "@oom-score");
+
+		oom_score = (v != NULL) ? atoi(v) : 0;
+		if (oom_score < 0)
+			oom_score = 0;
+		if (oom_score > 1000)
+			oom_score = 1000;
+	}
+
 	/* Block signals until fork has completed. */
 	sigfillset(&set);
 	sigprocmask(SIG_BLOCK, &set, &oldset);
@@ -427,6 +441,34 @@ spawn_pane(struct spawn_context *sc, char **cause)
 #endif
 	if (tcsetattr(STDIN_FILENO, TCSANOW, &now) != 0)
 		_exit(1);
+
+	/*
+	 * MEMORY: make the pane's processes the OOM killer's preferred victims
+	 * rather than the server. When the machine runs out of memory the
+	 * kernel kills SOMETHING; better one runaway program in one pane than
+	 * the multiplexer that owns every session. Raising oom_score_adj needs
+	 * no privilege (lowering it would); the child inherits nothing else.
+	 * @oom-score: 0..1000, 0 = leave the kernel default.
+	 */
+	/*
+	 * MEMORY: the child makes its own cgroup and joins it before exec -
+	 * charges follow allocations, so joining later would leave the memory
+	 * accounted somewhere else.
+	 */
+	swap_pane_join();
+
+	if (oom_score > 0) {
+		char	oombuf[16];
+		int	oomfd;
+
+		oomfd = open("/proc/self/oom_score_adj", O_WRONLY);
+		if (oomfd != -1) {
+			snprintf(oombuf, sizeof oombuf, "%d", oom_score);
+			if (write(oomfd, oombuf, strlen(oombuf)) < 0)
+				(void)0;	/* best effort */
+			close(oomfd);
+		}
+	}
 
 	/* Clean up file descriptors and signals and update the environment. */
 	proc_clear_signals(server_proc, 1);

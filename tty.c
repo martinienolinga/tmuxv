@@ -918,7 +918,7 @@ tty_window_offset1(struct tty *tty, u_int *ox, u_int *oy, u_int *sx, u_int *sy)
 	struct window_pane	*wp = server_client_get_pane(c);
 	u_int			 cx, cy, lines;
 
-	lines = status_line_size(c);
+	lines = status_line_size(c) + menu_bar_size(c); /* MENU BAR */
 
 	if (tty->sx >= w->sx && tty->sy - lines >= w->sy) {
 		*ox = 0;
@@ -1624,6 +1624,7 @@ tty_set_client_cb(struct tty_ctx *ttyctx, struct client *c)
 	ttyctx->yoff = ttyctx->ryoff = wp->yoff;
 	if (status_at_line(c) == 0)
 		ttyctx->yoff += status_line_size(c);
+	ttyctx->yoff += menu_bar_size(c); /* MENU BAR: always reserve top line */
 
 	return (1);
 }

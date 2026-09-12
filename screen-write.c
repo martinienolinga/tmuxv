@@ -142,6 +142,15 @@ screen_write_set_client_cb(struct tty_ctx *ttyctx, struct client *c)
 	if (wp->layout_cell == NULL)
 		return (0);
 
+	/*
+	 * DESKTOP: window content is composited from the grid and sent with
+	 * damage diffing, so skip the incremental path and request a redraw.
+	 */
+	if (desktop_enabled(c)) {
+		c->flags |= CLIENT_REDRAWWINDOW;
+		return (0);
+	}
+
 	if (wp->flags & (PANE_REDRAW|PANE_DROP))
 		return (-1);
 	if (c->flags & CLIENT_REDRAWPANES) {
@@ -163,6 +172,9 @@ screen_write_set_client_cb(struct tty_ctx *ttyctx, struct client *c)
 
 	if (status_at_line(c) == 0)
 		ttyctx->yoff += status_line_size(c);
+	ttyctx->yoff += menu_bar_size(c); /* MENU BAR: always reserve top line */
+	ttyctx->xoff += desktop_left(c);  /* DESKTOP: inset window content */
+	ttyctx->yoff += desktop_top(c);
 
 	return (1);
 }

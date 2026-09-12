@@ -183,8 +183,9 @@ clients_calculate_size(int type, int current, struct client *c,
 			cx = cw->sx;
 			cy = cw->sy;
 		} else {
-			cx = loop->tty.sx;
-			cy = loop->tty.sy - status_line_size(loop);
+			cx = loop->tty.sx - desktop_horiz_w(loop, w); /* DESKTOP */
+			cy = loop->tty.sy - status_line_size(loop) -
+			    menu_bar_size(loop) - desktop_vert_w(loop, w);
 		}
 
 		/*
@@ -296,8 +297,9 @@ default_window_size(struct client *c, struct session *s, struct window *w,
 	 * client and no window, use the default size as for manual type.
 	 */
 	if (type == WINDOW_SIZE_LATEST && c != NULL && !ignore_client_size(c)) {
-		*sx = c->tty.sx;
-		*sy = c->tty.sy - status_line_size(c);
+		*sx = c->tty.sx - desktop_horiz_w(c, w); /* DESKTOP */
+		*sy = c->tty.sy - status_line_size(c) - menu_bar_size(c) -
+		    desktop_vert_w(c, w); /* MENU BAR + DESKTOP */
 		*xpixel = c->tty.xpixel;
 		*ypixel = c->tty.ypixel;
 		log_debug("%s: using %ux%u from %s", __func__, *sx, *sy,

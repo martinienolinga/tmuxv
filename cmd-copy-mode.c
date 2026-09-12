@@ -89,6 +89,12 @@ cmd_copy_mode_exec(struct cmd *self, struct cmdq_item *item)
 		if (args_has(args, 'M'))
 			window_copy_start_drag(c, &event->m);
 	}
+	/*
+	 * Remember that this copy mode only exists to show a mouse selection:
+	 * typing must then go to the program, not to the mode.
+	 */
+	if (args_has(args, 'M'))
+		wp->drag_selection = 1;
 	if (args_has(args, 'u'))
 		window_copy_pageup(wp, 0);
 

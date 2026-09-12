@@ -179,6 +179,12 @@ cmd_resize_pane_mouse_update(struct client *c, struct mouse_event *m)
 	else if (m->statusat > 0 && ly >= (u_int)m->statusat)
 		ly = m->statusat - 1;
 
+	/* MENU BAR + DESKTOP: account for the rows/cols reserved above/left. */
+	if (y >= m->mtop) y -= m->mtop; else y = 0;
+	if (ly >= m->mtop) ly -= m->mtop; else ly = 0;
+	if (x >= m->mleft) x -= m->mleft; else x = 0;
+	if (lx >= m->mleft) lx -= m->mleft; else lx = 0;
+
 	for (i = 0; i < nitems(cells); i++) {
 		lc = layout_search_by_border(w->layout_root, lx + offsets[i][0],
 		    ly + offsets[i][1]);

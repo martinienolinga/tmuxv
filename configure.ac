@@ -269,6 +269,32 @@ if test "x$found_libevent" = xno; then
 	AC_MSG_ERROR("libevent not found")
 fi
 
+# tmuxv: the agent bus lives INSIDE the server. evhttp (libevent_extra) serves
+# its HTTP API on the server's own event loop; MariaDB keeps the messages and is
+# only ever touched from a dedicated thread, so a slow or absent database can
+# never freeze the server.
+PKG_CHECK_MODULES(
+	LIBEVENT_EXTRA,
+	[libevent_extra >= 2],
+	[
+		AM_CPPFLAGS="$LIBEVENT_EXTRA_CFLAGS $AM_CPPFLAGS"
+		CPPFLAGS="$AM_CPPFLAGS $SAVED_CPPFLAGS"
+		LIBS="$LIBEVENT_EXTRA_LIBS $LIBS"
+	],
+	AC_MSG_ERROR("libevent_extra (evhttp) not found: the agent bus needs it")
+)
+PKG_CHECK_MODULES(
+	LIBMARIADB,
+	[libmariadb],
+	[
+		AM_CPPFLAGS="$LIBMARIADB_CFLAGS $AM_CPPFLAGS"
+		CPPFLAGS="$AM_CPPFLAGS $SAVED_CPPFLAGS"
+		LIBS="$LIBMARIADB_LIBS $LIBS"
+	],
+	AC_MSG_ERROR("libmariadb not found: the agent bus needs it")
+)
+LIBS="-pthread $LIBS"
+
 # Look for yacc.
 AC_CHECK_PROG(found_yacc, $YACC, yes, no)
 if test "x$found_yacc" = xno; then

@@ -2,6 +2,14 @@
 bin_PROGRAMS = tmux
 CLEANFILES = tmux.1.mdoc tmux.1.man cmd-parse.c
 
+# tmuxv: the package version (packaging/src/control), built into the binary
+# so the About box always shows the version actually running.
+BUILT_SOURCES = tmuxv-version.h
+CLEANFILES += tmuxv-version.h
+tmuxv-version.h: $(srcdir)/packaging/src/control
+	@v=`sed -n 's/^Version: //p' $(srcdir)/packaging/src/control`; \
+	printf '#define TMUXV_VERSION "%s"\n' "$$v" > $@.tmp && mv $@.tmp $@
+
 # Distribution tarball options.
 EXTRA_DIST = \
 	CHANGES README README.ja COPYING example_tmux.conf \
@@ -188,7 +196,10 @@ dist_tmux_SOURCES = \
 	tty-features.c \
 	tty-keys.c \
 	tty-term.c \
+	swapmem.c \
 	tty.c \
+	upgrade.c \
+	bus.c \
 	utf8-combined.c \
 	utf8.c \
 	window-buffer.c \

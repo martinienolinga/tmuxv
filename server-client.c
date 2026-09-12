@@ -36,6 +36,14 @@ static void	server_client_check_window_resize(struct window *);
 static key_code	server_client_check_mouse(struct client *, struct key_event *);
 static void	server_client_repeat_timer(int, short, void *);
 static void	server_client_click_timer(int, short, void *);
+static void	server_client_desktop_sb_timer(int, short, void *);
+static void	desktop_scrollbar_step(struct client *, struct window_pane *,
+		    int);
+static void	desktop_scrollbar_thumb(struct client *, struct window_pane *,
+		    u_int, u_int);
+/* TVision TEventQueue: repeatDelay = 8 ticks of 55 ms, then every tick. */
+#define DESKTOP_SB_DELAY 440
+#define DESKTOP_SB_REPEAT 55
 static void	server_client_check_exit(struct client *);
 static void	server_client_check_redraw(struct client *);
 static void	server_client_check_modes(struct client *);
@@ -140,6 +148,7 @@ server_client_clear_overlay(struct client *c)
 	c->overlay_draw = NULL;
 	c->overlay_key = NULL;
 	c->overlay_free = NULL;
+	c->overlay_resize = NULL;	/* else MSG_RESIZE calls it with NULL data */
 	c->overlay_data = NULL;
 
 	c->tty.flags &= ~(TTY_FREEZE|TTY_NOCURSOR);
@@ -283,6 +292,7 @@ server_client_create(int fd)
 
 	evtimer_set(&c->repeat_timer, server_client_repeat_timer, c);
 	evtimer_set(&c->click_timer, server_client_click_timer, c);
+	evtimer_set(&c->desktop_sb_timer, server_client_desktop_sb_timer, c);
 
 	TAILQ_INSERT_TAIL(&clients, c, entry);
 	log_debug("new client %p", c);
@@ -437,6 +447,7 @@ server_client_lost(struct client *c)
 
 	evtimer_del(&c->repeat_timer);
 	evtimer_del(&c->click_timer);
+	evtimer_del(&c->desktop_sb_timer);
 
 	key_bindings_unref_table(c->keytable);
 
@@ -671,9 +682,431 @@ have_event:
 	m->wp = -1;
 	m->ignore = ignore;
 
+	/* DESKTOP: dragging the window title bar moves the floating window. */
+	{
+		u_int	rx, ry, rw, rh, at;
+
+		if (desktop_get_rect(c, &rx, &ry, &rw, &rh)) {
+			struct window	*dw = s->curw->window; /* current window */
+
+			at = menu_bar_size(c) +
+			    (status_at_line(c) == 0 ? status_line_size(c) : 0);
+			/* Close box [■] at the top-left of the title bar. */
+			if (type == DOWN && m->y == at + ry &&
+			    m->x >= rx + 2 && m->x <= rx + 4) {
+				server_kill_window(dw, 1);
+				recalculate_sizes();
+				return (KEYC_UNKNOWN);
+			}
+			/*
+			 * Zoom box [↑]/[↓] near the top-right maximises. Rapid
+			 * clicks arrive as SECOND/TRIPLE presses and each one
+			 * counts; the box travels with the window, so a double
+			 * click on it maximises once and the second press lands
+			 * inside the window, where it does nothing.
+			 */
+			if ((type == DOWN || type == SECOND || type == TRIPLE) &&
+			    rw > 12 && m->y == at + ry &&
+			    m->x >= rx + rw - 5 && m->x <= rx + rw - 3) {
+				desktop_toggle_zoom(c, dw);
+				return (KEYC_UNKNOWN);
+			}
+			/*
+			 * Double click on the title bar maximises/restores, as
+			 * everywhere else. DOUBLE is the deferred replay of the
+			 * second press, so the boxes are skipped here: they
+			 * already acted on each press, and toggling a third
+			 * time would undo what the user just did.
+			 */
+			if (type == DOUBLE && m->y == at + ry &&
+			    m->x >= rx && m->x < rx + rw &&
+			    !(m->x >= rx + 2 && m->x <= rx + 4) &&
+			    !(rw > 12 && m->x >= rx + rw - 5 &&
+			    m->x <= rx + rw - 3) &&
+			    MOUSE_BUTTONS(m->b) == MOUSE_BUTTON_1) {
+				c->desktop_dragging = 0;
+				desktop_toggle_zoom(c, dw);
+				return (KEYC_UNKNOWN);
+			}
+			/*
+			 * RESIZE has priority over the scrollbar at the shared
+			 * bottom-right column: an active resize follows the
+			 * mouse, and the 3x3 grip starts one. Both are checked
+			 * BEFORE the scrollbar so a corner grab (even an
+			 * imprecise one during rapid resizing) never falls into
+			 * the scrollbar and drops the pane into copy mode.
+			 */
+			/*
+			 * CLAUDE manager: the list column selects the shown
+			 * conversation, its last row is the "[+ Nouvelle]"
+			 * button, and the band between list and conversation
+			 * is dragged to resize the column.
+			 */
+			if (claude_manager(dw)) {
+				u_int	lw = claude_list_width(c, dw);
+				u_int	ih = (rh > 2) ? rh - 2 : 0;
+				u_int	top = at + ry + 1;
+
+				if (c->claude_band_drag) {
+					if (type == DRAG) {
+						u_int nw;
+
+						nw = (m->x > rx + 1) ?
+						    m->x - (rx + 1) : 1;
+						dw->claude_listw = nw;
+						recalculate_sizes();
+						server_redraw_client(c);
+						return (KEYC_UNKNOWN);
+					}
+					c->claude_band_drag = 0;
+					return (KEYC_UNKNOWN);
+				}
+				/*
+				 * The list has its own bar as soon as it
+				 * overflows: wheel anywhere over the column,
+				 * ▲/▼ step and auto-repeat while held, and the
+				 * thumb follows the mouse - the same
+				 * TScrollBar behaviour as everywhere else.
+				 */
+				if (lw != 0 && m->y >= top && m->y < top + ih &&
+				    m->x > rx && m->x <= rx + lw) {
+					u_int	bx, by, bsize;
+
+					if (type == WHEEL) {
+						claude_list_scroll(dw,
+						    MOUSE_BUTTONS(m->b) == MOUSE_WHEEL_UP ?
+						    -3 : 3);
+						return (KEYC_UNKNOWN);
+					}
+					if ((type == DOWN || type == SECOND ||
+					    type == TRIPLE) &&
+					    claude_list_scrollbar(c, dw, rx, ry,
+					    rw, rh, &bx, &by, &bsize)) {
+						by += at;
+						if (m->x == bx &&
+						    m->y >= by &&
+						    m->y < by + bsize) {
+							struct timeval	tv =
+							    { 0, DESKTOP_SB_DELAY * 1000 };
+
+							c->desktop_sb_list = 1;
+							c->desktop_sb_by = by;
+							c->desktop_sb_bsize =
+							    bsize;
+							c->desktop_sb_ax = m->x;
+							c->desktop_sb_ay = m->y;
+							if (m->y == by ||
+							    m->y == by + bsize - 1) {
+								c->desktop_sb_dir =
+								    (m->y == by) ?
+								    -1 : 1;
+								claude_list_scroll(
+								    dw,
+								    c->desktop_sb_dir);
+								c->desktop_sb_mode = 1;
+								c->desktop_sb_on = 1;
+								evtimer_del(&c->desktop_sb_timer);
+								evtimer_add(&c->desktop_sb_timer,
+								    &tv);
+							} else {
+								claude_list_scroll_to(
+								    dw,
+								    m->y - (by + 1),
+								    bsize - 2);
+								c->desktop_sb_mode = 2;
+							}
+							return (KEYC_UNKNOWN);
+						}
+					}
+				}
+				if ((type == DOWN || type == SECOND ||
+				    type == TRIPLE || type == DOUBLE) &&
+				    lw != 0 &&
+				    m->y >= top && m->y < top + ih) {
+					u_int		lrow = m->y - top, idx;
+					enum claude_row	kind;
+
+					if (m->x == rx + 1 + lw) {
+						if (type != DOUBLE)
+							c->claude_band_drag = 1;
+						return (KEYC_UNKNOWN);
+					}
+					if (m->x <= rx || m->x > rx + lw)
+						goto not_list;
+					/*
+					 * The SAME row map the drawing uses, so
+					 * a click always hits what is shown.
+					 */
+					kind = claude_list_row(c, dw, lrow,
+					    &idx);
+					switch (kind) {
+					case CLAUDE_ROW_NEW:
+						if (type != DOUBLE &&
+						    MOUSE_BUTTONS(m->b) ==
+						    MOUSE_BUTTON_1)
+							claude_new_shell(c);
+						break;
+					case CLAUDE_ROW_CONV:
+					case CLAUDE_ROW_SESS:
+						/*
+						 * Show / highlight, Ctrl or
+						 * Shift (Alt) to select
+						 * several, right-click for the
+						 * menu, DOUBLE click on a saved
+						 * one brings it back.
+						 */
+						claude_list_click(c, dw, kind,
+						    idx, type == DOUBLE, m->b,
+						    m->x, m->y);
+						break;
+					default:
+						break;
+					}
+					return (KEYC_UNKNOWN);
+				}
+not_list:
+			}
+
+			/*
+			 * Scrollbar interaction in progress: an arrow held down
+			 * (auto-repeats only while the mouse stays on it) or the
+			 * thumb being dragged (follows the mouse row anywhere,
+			 * grip row included, so it can reach live).
+			 */
+			if (c->desktop_sb_mode != 0) {
+				struct window_pane	*swp;
+				u_int	by = c->desktop_sb_by;
+				u_int	track = (c->desktop_sb_bsize > 2) ?
+					    c->desktop_sb_bsize - 2 : 1;
+				u_int	p;
+
+				if (c->desktop_sb_list) {
+					if (type == DRAG) {
+						if (c->desktop_sb_mode == 1) {
+							c->desktop_sb_on =
+							    (m->x == c->desktop_sb_ax &&
+							    m->y == c->desktop_sb_ay);
+						} else {
+							p = (m->y > by + 1) ?
+							    m->y - (by + 1) : 0;
+							claude_list_scroll_to(dw,
+							    p, track);
+						}
+						return (KEYC_UNKNOWN);
+					}
+					c->desktop_sb_mode = 0;
+					c->desktop_sb_list = 0;
+					evtimer_del(&c->desktop_sb_timer);
+					if (type == UP)
+						return (KEYC_UNKNOWN);
+				} else {
+				swp = window_pane_find_by_id(c->desktop_sb_wpid);
+				if (swp == NULL) {		/* pane gone */
+					c->desktop_sb_mode = 0;
+					evtimer_del(&c->desktop_sb_timer);
+				} else if (type == DRAG) {
+					if (c->desktop_sb_mode == 1)
+						c->desktop_sb_on =
+						    (m->x == c->desktop_sb_ax &&
+						    m->y == c->desktop_sb_ay);
+					else {
+						p = (m->y > by + 1) ?
+						    m->y - (by + 1) : 0;
+						desktop_scrollbar_thumb(c, swp, p,
+						    track);
+					}
+					return (KEYC_UNKNOWN);
+				} else {
+					/* Release (or anything else) ends it. */
+					c->desktop_sb_mode = 0;
+					evtimer_del(&c->desktop_sb_timer);
+					if (type == UP)
+						return (KEYC_UNKNOWN);
+				}
+				}
+			}
+			if (c->desktop_resizing) {
+				/* Live resize: follow the mouse. */
+				if (type == DRAG || type == DOWN) {
+					/*
+					 * The size is measured from the EFFECTIVE
+					 * origin (rx, ry); make the stored origin
+					 * match it first, otherwise a window whose
+					 * stored rect was off-area gets a garbage
+					 * size and jumps (torture test B5).
+					 */
+					dw->desktop_x = rx;
+					dw->desktop_y = ry;
+					/* TVision TWindow::minWinSize = 16x6. */
+					dw->desktop_w = (m->x > rx + 15) ?
+					    m->x - rx + 1 : 16;
+					dw->desktop_h = (m->y > at + ry + 5) ?
+					    m->y - (at + ry) + 1 : 6;
+					recalculate_sizes();
+					server_redraw_client(c);
+					return (KEYC_UNKNOWN);
+				}
+				c->desktop_resizing = 0;
+				return (KEYC_UNKNOWN);
+			}
+			/*
+			 * Resize grip exactly as TFrame::handleEvent: the
+			 * BOTTOM FRAME ROW only (mouse.y >= size.y-1), its last
+			 * cells (TVision: 2; 3 here for tolerance). It never
+			 * overlaps the scrollbar, which owns the whole right
+			 * column from ▲ down to ▼ (row rh-2). The old 3x3 zone
+			 * stole ▼ and the last track cell.
+			 */
+			if (type == DOWN && rw >= 4 && rh >= 3 &&
+			    m->y == at + ry + rh - 1 &&
+			    m->x >= rx + rw - 3 && m->x <= rx + rw - 1) {
+				/*
+				 * Resizing a pane that is in copy mode reflows
+				 * its backing screen and leaves the cursor/scroll
+				 * offset inconsistent (blank content, misplaced
+				 * cursor). Return to the live view first.
+				 */
+				if (dw->active != NULL &&
+				    window_copy_get_scroll(dw->active, NULL,
+				    NULL, NULL))
+					window_pane_reset_mode(dw->active);
+				c->desktop_resizing = 1;
+				return (KEYC_UNKNOWN);
+			}
+			/*
+			 * Vertical scrollbar on the right border, driven like
+			 * TScrollBar::handleEvent: a press on ▲/▼ steps one
+			 * line (arStep) and, held down, auto-repeats while the
+			 * mouse stays on the arrow (evMouseAuto, see the timer);
+			 * a press on the track or indicator grabs the thumb,
+			 * which then follows the mouse (TVision never page-jumps
+			 * here). Rapid clicks arrive as SECOND/TRIPLE presses
+			 * (DOUBLE is the deferred replay of a SECOND: never
+			 * counted). The bar owns the whole right column from ▲
+			 * to ▼; the resize grip lives on the bottom frame row
+			 * only (TFrame), so there is no overlap to arbitrate.
+			 */
+			if ((type == DOWN || type == SECOND || type == TRIPLE) &&
+			    rh > 4) {
+				struct window_pane	*wp, *hp = NULL;
+				u_int			 bx = 0, by = 0, bsize = 0;
+
+				/* ONE bar per pane: which pane's bar is hit? */
+				TAILQ_FOREACH(wp, &dw->panes, entry) {
+					if (!desktop_pane_scrollbar(c, wp, rx, ry,
+					    rw, rh, &bx, &by, &bsize))
+						continue;
+					by += at;
+					if (m->x == bx && m->y >= by &&
+					    m->y < by + bsize) {
+						hp = wp;
+						break;
+					}
+				}
+				if (hp != NULL) {
+					struct timeval	tv =
+					    { 0, DESKTOP_SB_DELAY * 1000 };
+
+					c->desktop_sb_wpid = hp->id;
+					c->desktop_sb_by = by;
+					c->desktop_sb_bsize = bsize;
+					c->desktop_sb_ax = m->x;
+					c->desktop_sb_ay = m->y;
+					if (m->y == by || m->y == by + bsize - 1) {
+						/* ▲ / ▼: step now, repeat while held */
+						c->desktop_sb_dir =
+						    (m->y == by) ? -1 : 1;
+						desktop_scrollbar_step(c, hp,
+						    c->desktop_sb_dir);
+						c->desktop_sb_mode = 1;
+						c->desktop_sb_on = 1;
+						evtimer_del(&c->desktop_sb_timer);
+						evtimer_add(&c->desktop_sb_timer,
+						    &tv);
+					} else {	/* track: grab the thumb */
+						desktop_scrollbar_thumb(c, hp,
+						    m->y - (by + 1), bsize - 2);
+						c->desktop_sb_mode = 2;
+					}
+					return (KEYC_UNKNOWN);
+				}
+			}
+			if (c->desktop_dragging) {
+				/* Live move: follow the mouse (damage diffing
+				 * keeps it flicker-free). */
+				if (type == DRAG || type == DOWN) {
+					u_int	aw, ah, nx, ny;
+
+					nx = (m->x >= c->desktop_drag_dx) ?
+					    m->x - c->desktop_drag_dx : 0;
+					ny = (m->y >= at) ? m->y - at : 0;
+					/*
+					 * Keep the window inside the area on all
+					 * four sides (not just top-left), so the
+					 * stored rect always matches what is drawn.
+					 */
+					if (desktop_get_area(c, &aw, &ah)) {
+						if (nx + rw > aw)
+							nx = (aw > rw) ? aw - rw : 0;
+						if (ny + rh > ah)
+							ny = (ah > rh) ? ah - rh : 0;
+					}
+					dw->desktop_x = nx;
+					dw->desktop_y = ny;
+					server_redraw_client(c);
+					return (KEYC_UNKNOWN);
+				}
+				c->desktop_dragging = 0;
+				return (KEYC_UNKNOWN);
+			}
+			if (type == DOWN && m->y == at + ry &&
+			    m->x >= rx && m->x < rx + rw) {
+				c->desktop_dragging = 1;
+				c->desktop_drag_dx = m->x - rx;
+				c->desktop_drag_dy = 0;
+				return (KEYC_UNKNOWN);
+			}
+
+			/*
+			 * Click on a background window raises it - but only if
+			 * the click is NOT inside the current (front) window,
+			 * which is on top and owns clicks in its own area.
+			 */
+			if (type == DOWN &&
+			    !(m->x >= rx && m->x < rx + rw &&
+			    m->y >= at + ry && m->y < at + ry + rh)) {
+				struct winlink	*wl, *hit = NULL;
+				u_int		 wx, wy, ww, wh;
+
+				RB_FOREACH(wl, winlinks, &s->windows) {
+					if (wl->window == s->curw->window)
+						continue;
+					if (!desktop_get_rect_w(c, wl->window,
+					    &wx, &wy, &ww, &wh))
+						continue;
+					if (m->x >= wx && m->x < wx + ww &&
+					    m->y >= at + wy &&
+					    m->y < at + wy + wh)
+						hit = wl;
+				}
+				if (hit != NULL) {
+					session_set_current(s, hit);
+					recalculate_sizes();
+					server_redraw_client(c);
+					return (KEYC_UNKNOWN);
+				}
+			}
+		}
+	}
+
 	/* Is this on the status line? */
 	m->statusat = status_at_line(c);
 	m->statuslines = status_line_size(c);
+	m->mtop = menu_bar_size(c) + desktop_top(c); /* rows above pane area */
+	m->mleft = desktop_left(c);                  /* cols left of pane area */
+	/* CLAUDE: the manager's list column shifts its panes to the right. */
+	if (c->session != NULL && c->session->curw != NULL)
+		m->mleft += claude_inset(c, c->session->curw->window);
 	if (m->statusat != -1 &&
 	    y >= (u_int)m->statusat &&
 	    y < m->statusat + m->statuslines) {
@@ -727,15 +1160,45 @@ have_event:
 		}
 	}
 
+	/* MENU BAR: on the top menu bar line? Open the dropdown natively (C). */
+	if (where == NOWHERE && menu_bar_size(c) != 0 && y < menu_bar_size(c)) {
+		sr = menu_bar_get_range(c, x);
+		if (sr == NULL || sr->type != STYLE_RANGE_USER)
+			return (KEYC_UNKNOWN);
+		/* Turbo Vision: a menu opens on click, never on plain hover. */
+		if (strncmp(sr->string, "menu_", 5) == 0 && type == DOWN)
+			menu_bar_open(c, (u_int)atoi(sr->string + 5), sr->start);
+		return (KEYC_UNKNOWN);
+	}
+
 	/* Not on status line. Adjust position and check for border or pane. */
 	if (where == NOWHERE) {
-		px = x;
-		if (m->statusat == 0 && y >= m->statuslines)
-			py = y - m->statuslines;
+		u_int	mb = menu_bar_size(c); /* MENU BAR: reserved top line */
+
+		/*
+		 * DESKTOP: on the bare desktop (every window closed) there is
+		 * no window and no pane to act on - the placeholder's dead pane
+		 * covers the area but must never produce pane events, or a
+		 * right click would open the pane menu over the void.
+		 */
+		if (desktop_placeholder(s->curw->window))
+			return (KEYC_UNKNOWN);
+
+		u_int	dtop = desktop_top(c), dleft = desktop_left(c); /* DESKTOP */
+
+		if (mb != 0 && y < mb)
+			return (KEYC_UNKNOWN); /* on the menu bar: ignore for now */
+		if (dleft != 0 && x < dleft)
+			return (KEYC_UNKNOWN); /* on the desktop/frame */
+		px = x - dleft;
+		if (m->statusat == 0 && y >= m->statuslines + mb + dtop)
+			py = y - m->statuslines - mb - dtop;
 		else if (m->statusat > 0 && y >= (u_int)m->statusat)
 			py = m->statusat - 1;
+		else if (y >= mb + dtop)
+			py = y - mb - dtop;
 		else
-			py = y;
+			return (KEYC_UNKNOWN); /* on the desktop/title area */
 
 		tty_window_offset(&c->tty, &m->ox, &m->oy, &sx, &sy);
 		log_debug("mouse window @%u at %u,%u (%ux%u)",
@@ -1799,6 +2262,40 @@ server_client_is_bracket_pasting(struct client *c, key_code key)
 	return !!(c->flags & CLIENT_BRACKETPASTING);
 }
 
+/*
+ * A paste must reach the program even when the pane is showing a selection.
+ * Keeping the selection visible after a drag leaves the pane in copy mode, and
+ * window_pane_key() hands every key to the MODE instead of the program - so
+ * pasting from the terminal would silently do nothing. Leave copy mode (and
+ * only copy/view mode: other modes are not touched) before forwarding.
+ */
+static void
+server_client_paste_leave_mode(struct window_pane *wp)
+{
+	struct window_mode_entry	*wme;
+
+	if (wp == NULL)
+		return;
+	wme = TAILQ_FIRST(&wp->modes);
+	if (wme == NULL)
+		return;
+	if (wme->mode == &window_copy_mode || wme->mode == &window_view_mode)
+		window_pane_reset_mode(wp);
+}
+
+/* Would this key insert text if the pane were not in a mode? */
+static int
+server_client_key_is_text(key_code key)
+{
+	key_code	k = key & KEYC_MASK_KEY;
+
+	if (key & (KEYC_CTRL|KEYC_META))
+		return (0);
+	if (k == '\r' || k == '\n' || k == '\t' || k == KEYC_BSPACE)
+		return (1);
+	return (k >= 0x20 && k < KEYC_BASE);
+}
+
 /* Is this fast enough to probably be a paste? */
 static int
 server_client_assume_paste(struct session *s)
@@ -1898,6 +2395,10 @@ server_client_key_callback(struct cmdq_item *item, void *data)
 		event->key = key;
 	}
 
+	/* MENU BAR: Alt+mnemonic opens a menu (handled natively, in C). */
+	if (!KEYC_IS_MOUSE(key) && menu_bar_key(c, key))
+		goto out;
+
 	/* Find affected pane. */
 	if (!KEYC_IS_MOUSE(key) || cmd_find_from_mouse(&fs, m, 0) != 0)
 		cmd_find_from_client(&fs, c, 0);
@@ -1908,14 +2409,31 @@ server_client_key_callback(struct cmdq_item *item, void *data)
 		goto forward_key;
 
 	/* Forward if bracket pasting. */
-	if (server_client_is_bracket_pasting(c, key))
+	if (server_client_is_bracket_pasting(c, key)) {
+		server_client_paste_leave_mode(wp);
 		goto forward_key;
+	}
 
 	/* Treat everything as a regular key when pasting is detected. */
 	if (!KEYC_IS_MOUSE(key) &&
 	    (~key & KEYC_SENT) &&
-	    server_client_assume_paste(s))
+	    server_client_assume_paste(s)) {
+		server_client_paste_leave_mode(wp);
 		goto forward_key;
+	}
+
+	/*
+	 * A selection made with the mouse keeps the pane in copy mode so that
+	 * the highlight stays visible. That must not swallow what is typed
+	 * next: like in a graphical editor, typing drops the selection and
+	 * reaches the program. Copy mode entered deliberately is untouched.
+	 */
+	if (wp != NULL && wp->drag_selection && !KEYC_IS_MOUSE(key) &&
+	    server_client_is_default_key_table(c, c->keytable) &&
+	    server_client_key_is_text(key)) {
+		server_client_paste_leave_mode(wp);
+		goto forward_key;
+	}
 
 	/*
 	 * Work out the current key table. If the pane is in a mode, use
@@ -2109,14 +2627,188 @@ server_client_loop(void)
 	struct window		*w;
 	struct window_pane	*wp;
 
+	/*
+	 * CLAUDE: the mail watcher must run whenever a manager window exists,
+	 * whatever brought that window into being. It used to be armed only by
+	 * the claude-manager command, then by a hot upgrade, then by drawing the
+	 * manager's list - so after a cold restore with ANOTHER window on screen
+	 * nobody polled the bus, and no agent received a single message. Checked
+	 * here, on every loop, it costs one flag test when already running.
+	 */
+	claude_bus_start();
+
 	/* Check for window resize. This is done before redrawing. */
 	RB_FOREACH(w, windows, &windows)
 		server_client_check_window_resize(w);
+
+	/*
+	 * CLAUDE: a manager window shows exactly one conversation, so restore
+	 * its zoom here rather than after each action - splitting, killing a
+	 * pane or a plain "exit" all unzoom, and rapid clicks on "[+ Nouvelle]"
+	 * would race a toggling `resize-pane -Z`. This is idempotent.
+	 */
+	{
+		struct winlink	*wl;
+		int		 fixed = 0;
+
+		/*
+		 * Only windows still linked into a live session: those are
+		 * guaranteed to be referenced, so zooming them (which notifies)
+		 * cannot resurrect a dying window. Walking the whole window
+		 * tree here double-freed windows during kill-server.
+		 */
+		TAILQ_FOREACH(c, &clients, entry) {
+			if (c->session == NULL)
+				continue;
+			RB_FOREACH(wl, winlinks, &c->session->windows)
+				fixed |= claude_fix_zoom(wl->window);
+		}
+		if (fixed)		/* resize once, outside the walk */
+			recalculate_sizes();
+	}
+
+	/*
+	 * DESKTOP: the empty-desktop placeholder only stands in for "no window
+	 * at all". As soon as a real window exists in its session, drop it -
+	 * self-repairing, so every way of creating a window is covered.
+	 */
+	{
+		struct session	*s;
+		struct winlink	*wl, *wl1, *ph;
+
+		RB_FOREACH(s, sessions, &sessions) {
+			if (winlink_count(&s->windows) < 2)
+				continue;
+			ph = NULL;
+			RB_FOREACH(wl, winlinks, &s->windows) {
+				if (desktop_placeholder(wl->window)) {
+					ph = wl;
+					break;
+				}
+			}
+			if (ph == NULL)
+				continue;
+			wl1 = ph;
+			ph->window->desktop_ph = 0;	/* let it die normally */
+			server_kill_window(wl1->window, 1);
+			recalculate_sizes();
+			break;			/* the tree changed: next pass */
+		}
+
+		/*
+		 * Anything that puts a LIVE pane in the placeholder (a split, a
+		 * joined pane, a respawn) has really created a window: make it
+		 * one, dropping the dead pane that stood for "nothing". Without
+		 * this the new shell would run behind a desktop that draws
+		 * nothing - alive and invisible.
+		 */
+		RB_FOREACH(s, sessions, &sessions) {
+			struct window_pane	*wp, *wp1;
+			struct window		*w2;
+			int			 live;
+
+			RB_FOREACH(wl, winlinks, &s->windows) {
+				w2 = wl->window;
+				if (!desktop_placeholder(w2))
+					continue;
+				live = 0;
+				TAILQ_FOREACH(wp, &w2->panes, entry) {
+					if (wp->fd != -1)
+						live = 1;
+				}
+				if (!live)
+					continue;
+				w2->desktop_ph = 0;
+				options_remove_or_default(options_get(
+				    w2->options, "automatic-rename"), -1, NULL);
+				TAILQ_FOREACH_SAFE(wp, &w2->panes, entry, wp1) {
+					if (wp->fd == -1)
+						server_destroy_pane(wp, 0);
+				}
+				free(w2->name);
+				w2->name = default_window_name(w2);
+				recalculate_sizes();
+				server_redraw_window(w2);
+			}
+		}
+
+		/*
+		 * Leaving the windowed mode with nothing but the empty desktop
+		 * would strand the user on a dead pane: bring the window back
+		 * to life as an ordinary shell instead.
+		 */
+		RB_FOREACH(s, sessions, &sessions) {
+			struct client		*c2;
+			struct cmdq_state	*state;
+			char			*cmd, *error;
+			int			 desk = 0;
+
+			RB_FOREACH(wl, winlinks, &s->windows) {
+				if (desktop_placeholder(wl->window))
+					break;
+			}
+			if (wl == NULL)
+				continue;
+			TAILQ_FOREACH(c2, &clients, entry) {
+				if (c2->session == s && desktop_enabled(c2))
+					desk = 1;
+			}
+			if (desk)
+				continue;
+			TAILQ_FOREACH(c2, &clients, entry) {
+				if (c2->session == s)
+					break;
+			}
+			if (c2 == NULL)
+				continue;	/* detached: decide on attach */
+			wl->window->desktop_ph = 0;
+			/* Give the window its ordinary name back. */
+			options_remove_or_default(options_get(
+			    wl->window->options, "automatic-rename"), -1, NULL);
+			free(wl->window->name);
+			wl->window->name = default_window_name(wl->window);
+			xasprintf(&cmd, "respawn-window -k -t @%u",
+			    wl->window->id);
+			state = cmdq_new_state(NULL, NULL, 0);
+			if (cmd_parse_and_append(cmd, NULL, c2, state,
+			    &error) == CMD_PARSE_ERROR)
+				free(error);
+			cmdq_free_state(state);
+			free(cmd);
+			break;
+		}
+	}
+
+	claude_bus_poll();	/* agent bus: who has new mail (throttled) */
 
 	/* Check clients. */
 	TAILQ_FOREACH(c, &clients, entry) {
 		server_client_check_exit(c);
 		if (c->session != NULL) {
+			/*
+			 * DESKTOP: keep background windows live - if any pane in
+			 * a non-current window changed, redraw the whole client
+			 * so the desktop and background windows refresh.
+			 */
+			if (desktop_enabled(c)) {
+				struct winlink	*wl;
+				size_t		 used;
+
+				RB_FOREACH(wl, winlinks, &c->session->windows) {
+					if (wl->window == c->session->curw->window)
+						continue;
+					used = 0;
+					TAILQ_FOREACH(wp, &wl->window->panes,
+					    entry)
+						used += wp->offset.used;
+					if (used != wl->window->desktop_last_used) {
+						wl->window->desktop_last_used =
+						    used;
+						c->flags |=
+						    CLIENT_REDRAWWINDOW;
+					}
+				}
+			}
 			server_client_check_modes(c);
 			server_client_check_redraw(c);
 			server_client_reset_state(c);
@@ -2375,7 +3067,7 @@ server_client_reset_state(struct client *c)
 	tty_margin_off(tty);
 
 	/* Move cursor to pane cursor and offset. */
-	if (c->prompt_string != NULL) {
+	if (c->prompt_string != NULL && !c->prompt_dialog) {
 		n = options_get_number(c->session->options, "status-position");
 		if (n == 0)
 			cy = 0;
@@ -2400,6 +3092,11 @@ server_client_reset_state(struct client *c)
 
 			if (status_at_line(c) == 0)
 				cy += status_line_size(c);
+			cy += menu_bar_size(c); /* MENU BAR */
+			cx += desktop_left(c);  /* DESKTOP */
+			cy += desktop_top(c);
+			/* CLAUDE: panes sit right of the list column. */
+			cx += claude_inset(c, wp->window);
 		}
 		if (!cursor)
 			mode &= ~MODE_CURSOR;
@@ -2414,6 +3111,7 @@ server_client_reset_state(struct client *c)
 	if (options_get_number(oo, "mouse")) {
 		if (c->overlay_draw == NULL) {
 			mode &= ~ALL_MOUSE_MODES;
+			mode |= MODE_MOUSE_ALL; /* HOVER PATCH: report all motion */
 			TAILQ_FOREACH(loop, &w->panes, entry) {
 				if (loop->screen->mode & MODE_MOUSE_ALL)
 					mode |= MODE_MOUSE_ALL;
@@ -2450,6 +3148,91 @@ server_client_repeat_timer(__unused int fd, __unused short events, void *data)
 }
 
 /* Double-click callback. */
+/*
+ * Desktop window scrollbar (Turbo Vision TScrollBar semantics on the current
+ * window's active pane). Timings (DESKTOP_SB_DELAY/REPEAT, top of file) are
+ * TEventQueue's: 8 ticks of 55 ms before the first auto-repeat, then 1 tick.
+ */
+static void
+desktop_scrollbar_get(struct window_pane *wp, u_int *oy, u_int *hsize)
+{
+	if (!window_copy_get_scroll(wp, oy, hsize, NULL)) {
+		*oy = 0;
+		*hsize = screen_hsize(&wp->base);
+	}
+}
+
+/*
+ * Apply an absolute scroll-back offset. Reaching the bottom returns to the
+ * LIVE view (leave copy mode) so the prompt and cursor are correct again.
+ */
+static void
+desktop_scrollbar_apply(struct client *c, struct window_pane *wp, u_int target)
+{
+	if (target == 0) {
+		if (window_copy_get_scroll(wp, NULL, NULL, NULL))
+			window_pane_reset_mode(wp);
+	} else
+		window_copy_set_scroll(wp, target);
+	server_redraw_client(c);
+}
+
+/* ▲ (dir < 0: one line older) / ▼ (dir > 0): arStep = 1. */
+static void
+desktop_scrollbar_step(struct client *c, struct window_pane *wp, int dir)
+{
+	u_int	oy, hsize, target;
+
+	desktop_scrollbar_get(wp, &oy, &hsize);
+	if (dir < 0)
+		target = (oy + 1 <= hsize) ? oy + 1 : hsize;
+	else
+		target = (oy > 0) ? oy - 1 : 0;
+	desktop_scrollbar_apply(c, wp, target);
+}
+
+/* Thumb moved to track row p: TScrollBar::getPos() inverse. */
+static void
+desktop_scrollbar_thumb(struct client *c, struct window_pane *wp, u_int p,
+    u_int track)
+{
+	u_int	oy, hsize, content_top, target;
+
+	desktop_scrollbar_get(wp, &oy, &hsize);
+	content_top = scrollbar_value(p, hsize, track);
+	target = (hsize > content_top) ? hsize - content_top : 0;
+	desktop_scrollbar_apply(c, wp, target);
+}
+
+/* evMouseAuto: repeat the held arrow while the mouse is still on it. */
+static void
+server_client_desktop_sb_timer(__unused int fd, __unused short events,
+    void *data)
+{
+	struct client		*c = data;
+	struct timeval		 tv = { 0, DESKTOP_SB_REPEAT * 1000 };
+	struct window_pane	*wp;
+
+	if (c->desktop_sb_mode != 1)
+		return;
+	if (c->desktop_sb_list) {	/* the manager list's own bar */
+		if (c->session == NULL || c->session->curw == NULL)
+			return;
+		if (c->desktop_sb_on) {
+			claude_list_scroll(c->session->curw->window,
+			    c->desktop_sb_dir);
+		}
+		evtimer_add(&c->desktop_sb_timer, &tv);
+		return;
+	}
+	wp = window_pane_find_by_id(c->desktop_sb_wpid);
+	if (wp == NULL)
+		return;			/* the pane went away */
+	if (c->desktop_sb_on)
+		desktop_scrollbar_step(c, wp, c->desktop_sb_dir);
+	evtimer_add(&c->desktop_sb_timer, &tv);
+}
+
 static void
 server_client_click_timer(__unused int fd, __unused short events, void *data)
 {
@@ -3084,7 +3867,12 @@ server_client_get_cwd(struct client *c, struct session *s)
 {
 	const char	*home;
 
-	if (!cfg_finished && cfg_client != NULL)
+	/*
+	 * The configuration client may have no cwd: a client rebuilt by a hot
+	 * upgrade never went through MSG_IDENTIFY_CWD, and returning NULL made
+	 * the `run` of a configuration (tpm...) crash the server.
+	 */
+	if (!cfg_finished && cfg_client != NULL && cfg_client->cwd != NULL)
 		return (cfg_client->cwd);
 	if (c != NULL && c->session == NULL && c->cwd != NULL)
 		return (c->cwd);

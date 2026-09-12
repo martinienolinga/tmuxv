@@ -197,6 +197,18 @@ server_kill_window(struct window *w, int renumber)
 	struct session	*s, *s1;
 	struct winlink	*wl;
 
+	/*
+	 * DESKTOP: closing the LAST window must leave an empty desktop, not end
+	 * the session - which, for the last session, would stop the server and
+	 * drop the user out of the windowed mode entirely. Keep the window as a
+	 * placeholder that is never drawn.
+	 */
+	if (desktop_keep_window(w)) {
+		desktop_make_placeholder(w);
+		recalculate_sizes();
+		return;
+	}
+
 	RB_FOREACH_SAFE(s, sessions, &sessions, s1) {
 		if (!session_has(s, w))
 			continue;
@@ -325,6 +337,14 @@ server_destroy_pane(struct window_pane *wp, int notify)
 		wp->fd = -1;
 	}
 
+	/*
+	 * DESKTOP: the placeholder's pane is already dead - its process was hung
+	 * up when the window became the empty desktop. Keep the object: removing
+	 * it would leave a window with no pane and take the session down.
+	 */
+	if (w->desktop_ph)
+		return;
+
 	remain_on_exit = options_get_number(wp->options, "remain-on-exit");
 	if (remain_on_exit != 0 && (~wp->flags & PANE_STATUSREADY))
 		return;
@@ -367,6 +387,18 @@ server_destroy_pane(struct window_pane *wp, int notify)
 	if (notify)
 		notify_pane("pane-exited", wp);
 
+	/*
+	 * DESKTOP: this is the last pane of the last window - keep the pane
+	 * OBJECT and turn the window into the empty desktop. Removing it first
+	 * and catching the window in server_kill_window() would be too late:
+	 * the window would briefly have no pane at all, which crashes the
+	 * server loop.
+	 */
+	if (window_count_panes(w) == 1 && desktop_keep_window(w)) {
+		desktop_make_placeholder(w);
+		return;
+	}
+
 	server_unzoom_window(w);
 	server_client_remove_pane(wp);
 	layout_close_pane(wp);
@@ -374,8 +406,16 @@ server_destroy_pane(struct window_pane *wp, int notify)
 
 	if (TAILQ_EMPTY(&w->panes))
 		server_kill_window(w, 1);
-	else
+	else {
+		/*
+		 * CLAUDE: do NOT re-zoom here. window_destroy() frees the
+		 * layout roots BEFORE destroying the panes, so touching the
+		 * layout from this path double-frees them (heap corruption on
+		 * kill-server). server_client_loop() restores the zoom on the
+		 * next pass, and only for windows still in the tree.
+		 */
 		server_redraw_window(w);
+	}
 }
 
 static void
